@@ -51,7 +51,7 @@ SYSTEM_PROMPT = (
 
 MODEL = "gemini-3.5-flash-lite"
 
-ai = genai.Client(api_key="PASTE_GEMINI_KEY_HERE")
+ai = genai.Client(api_key="GEMINI_API_KEY")
 chats = {}  # channel id -> chat session (remembers history)
 afk = {}    # user id -> (reason, time they went afk)
 
@@ -589,18 +589,16 @@ def build_help_embed(bot_user):
         f"`{PREFIX}help` - Shows this help message.\n"
         f"`{PREFIX}afk <reason>` - Marks you as away. The bot tells anyone who pings you.\n"
         f"`{PREFIX}summarize` - Summarizes the last 50 messages in the channel.\n"
-        f"`{PREFIX}reset` - Clears my memory in this channel (mods/admins only).\n"
+        f"`{PREFIX}reset` - Clears my memory in this channel.\n"
         f"`{PREFIX}warnings [@user]` - Shows your warnings. Mods can check anyone.\n"
         "\n"
-        "**🛡️ Moderation (mods/admins only):**\n"
+        "**🛡️ Moderation:**\n"
         f"`{PREFIX}warn @user <reason>` - Warns for Promoting / Other servers / Others.\n"
         f"`{PREFIX}warn @user nsfw <reason>` - Warns for NSFW.\n"
         f"`{PREFIX}to @user <time> [reason]` - Times someone out (`10m`, `2h`, `3d`, `1w`).\n"
         f"`{PREFIX}rto @user` - Removes a timeout.\n"
         f"`{PREFIX}delwarn <id>` - Removes one warning.\n"
         f"`{PREFIX}clearwarns @user` - Clears all of a member's warnings.\n"
-        "\n"
-        "**⚡ Slash versions:** `/warn`, `/to`, `/rto`, `/warnings`, `/delwarn`, `/clearwarns`\n"
         "\n"
         "**🤖 Chat:**\n"
         "`@mention` - Mention me with a question and i'll answer.\n"
@@ -972,4 +970,4 @@ async def slash_clearwarns(interaction: discord.Interaction, user: discord.User)
     await slash_finish(interaction, error, embed)
 
 
-clients.run("PASTE_BOT_TOKEN_HERE")
+clients.run("BOT_TOKEN_HERE")
