@@ -7,7 +7,7 @@ from discord import app_commands
 from google import genai
 from google.genai import types
 
-PREFIX = ";"  # change this to , or ! or . if you want a different symbol
+PREFIX = ";"
 
 # Bot status: shows as "Listening to ..." and rotates through this list.
 # {servers} is replaced by the server count if you ever want to use it.
@@ -56,7 +56,7 @@ chats = {}  # channel id -> chat session (remembers history)
 afk = {}    # user id -> (reason, time they went afk)
 
 # Embed colors
-COLOR_AFK = discord.Color(0x4F545C)  # gray, like your screenshot
+COLOR_AFK = discord.Color(0x4F545C) 
 COLOR_WARN = discord.Color.orange()
 
 # Words to watch for -> emoji to react with
@@ -79,7 +79,7 @@ REACTIONS = {
 }
 
 # ---------------------------------------------------------------------------
-# Warning database (a small file saved next to main.py)
+# Warning database
 # ---------------------------------------------------------------------------
 db = sqlite3.connect(DB_FILE)
 db.execute(
@@ -93,7 +93,7 @@ db.execute(
         category TEXT NOT NULL DEFAULT 'general'
     )"""
 )
-# Upgrade older database files that don't have the category column yet
+
 _columns = [row[1] for row in db.execute("PRAGMA table_info(warnings)")]
 if "category" not in _columns:
     db.execute("ALTER TABLE warnings ADD COLUMN category TEXT NOT NULL DEFAULT 'general'")
