@@ -7,7 +7,7 @@ from discord import app_commands
 from google import genai
 from google.genai import types
 
-PREFIX = ";"
+PREFIX = ";"  # change this to , or ! or . if you want a different symbol
 
 # Bot status: shows as "Listening to ..." and rotates through this list.
 # {servers} is replaced by the server count if you ever want to use it.
@@ -51,13 +51,13 @@ SYSTEM_PROMPT = (
 
 MODEL = "gemini-3.5-flash-lite"
 
-ai = genai.Client(api_key="GEMINi_API_KEY") 
+ai = genai.Client(api_key="PASTE_GEMINI_KEY_HERE")
 chats = {}  # channel id -> chat session (remembers history)
 afk = {}    # user id -> (reason, time they went afk)
 
 # Embed colors
-COLOR_AFK = discord.Color(0x4F545C) 
-COLOR_WARN = discord.Color.orange()
+COLOR_AFK = discord.Color(0x4F545C)  # gray
+COLOR_WARN = discord.Color(0x010101)  # black (see note: pure 000000 can show as "no color")
 
 # Words to watch for -> emoji to react with
 REACTIONS = {
@@ -79,7 +79,7 @@ REACTIONS = {
 }
 
 # ---------------------------------------------------------------------------
-# Warning database
+# Warning database (a small file saved next to main.py)
 # ---------------------------------------------------------------------------
 db = sqlite3.connect(DB_FILE)
 db.execute(
@@ -93,7 +93,7 @@ db.execute(
         category TEXT NOT NULL DEFAULT 'general'
     )"""
 )
-
+# Upgrade older database files that don't have the category column yet
 _columns = [row[1] for row in db.execute("PRAGMA table_info(warnings)")]
 if "category" not in _columns:
     db.execute("ALTER TABLE warnings ADD COLUMN category TEXT NOT NULL DEFAULT 'general'")
@@ -153,6 +153,7 @@ UNIT_MINUTES = {
     "w": 10080, "wk": 10080, "wks": 10080, "week": 10080, "weeks": 10080,
     "mo": 43200, "month": 43200, "months": 43200,  # a month counts as 30 days
 }
+DURATION_HELP = "Time examples: `10m` (minutes), `2h` (hours), `3d` (days), `1w` (weeks)"
 
 
 def is_mod(member):
@@ -211,13 +212,17 @@ def step_label(step):
     return f"{format_duration(step)} timeout"
 
 
-def check_target(message, target):
-    """Returns a problem message if the author can't act on the target, else None."""
-    guild = message.guild
-    if target.bot or target.id == message.author.id or target.id == guild.owner_id:
-        return "You can't do that to that person."
-    if message.author.id != guild.owner_id and target.top_role >= message.author.top_role:
-        return "That member's top role is the same as or higher than yours."
+def validate(guild, author, target=None):
+    """Returns a problem message if the author can't do a mod action, else None."""
+    if guild is None:
+        return "That only works inside a server."
+    if not is_mod(author):
+        return "Only **mods** and **admins** can use that."
+    if target is not None:
+        if target.bot or target.id == author.id or target.id == guild.owner_id:
+            return "You can't do that to that person."
+        if author.id != guild.owner_id and target.top_role >= author.top_role:
+            return "That member's top role is the same as or higher than yours."
     return None
 
 
@@ -257,43 +262,15 @@ async def send_mod_log(guild, embed, current_channel_id):
 
 
 # ---------------------------------------------------------------------------
-# Moderation commands
+# Moderation logic (shared by the ;prefix commands and the /slash commands)
+# Each function returns (error_text, embed). One of them is always None.
 # ---------------------------------------------------------------------------
-async def handle_warn(message):
-    """;warn @user [nsfw] <reason>"""
-    no_pings = discord.AllowedMentions.none()
-    guild = message.guild
-    if guild is None:
-        await message.reply("Warnings only work inside a server.")
-        return
-    if not is_mod(message.author):
-        await message.reply("Only **mods** and **admins** can warn people.")
-        return
-
-    args = message.content.strip().split(maxsplit=2)
-    target = await find_member(guild, args[1]) if len(args) > 1 else None
-    if target is None:
-        await message.reply(
-            f"Usage: `{PREFIX}warn @user <reason>` for Promoting / Other servers / Others\n"
-            f"or `{PREFIX}warn @user nsfw <reason>` for NSFW"
-        )
-        return
-    problem = check_target(message, target)
+async def do_warn(guild, author, target, category, reason, channel_id):
+    problem = validate(guild, author, target)
     if problem:
-        await message.reply(problem)
-        return
+        return problem, None
 
-    # Category: "nsfw" or "general" can be the first word after the user.
-    # With no category word, it counts as Promoting / Other servers / Others.
-    rest = args[2].strip() if len(args) > 2 else ""
-    category = "general"
-    first, _, remainder = rest.partition(" ")
-    if first.lower() in CATEGORY_LABELS:
-        category = first.lower()
-        rest = remainder.strip()
-    reason = rest[:300] or "No reason given"
-
-    warn_id = add_warning(guild.id, target.id, message.author.id, reason, category)
+    warn_id = add_warning(guild.id, target.id, author.id, reason, category)
     rows = get_warnings(guild.id, target.id)
     offense = sum(1 for row in rows if row[4] == category)
     ladder = LADDERS[category]
@@ -336,7 +313,7 @@ async def handle_warn(message):
 
     embed = discord.Embed(title="⚠️ Member warned", color=COLOR_WARN)
     embed.add_field(name="Member", value=target.mention)
-    embed.add_field(name="Warned by", value=message.author.mention)
+    embed.add_field(name="Warned by", value=author.mention)
     embed.add_field(name="Offense", value=f"{min(offense, len(ladder))} of {len(ladder)}")
     embed.add_field(name="Rule", value=CATEGORY_LABELS[category], inline=False)
     embed.add_field(name="Reason", value=reason, inline=False)
@@ -344,53 +321,30 @@ async def handle_warn(message):
     if note:
         embed.add_field(name="Result", value=note, inline=False)
     embed.set_footer(text=f"Warning ID: {warn_id}")
-    await message.reply(embed=embed, allowed_mentions=no_pings)
-    await send_mod_log(guild, embed, message.channel.id)
+    await send_mod_log(guild, embed, channel_id)
+    return None, embed
 
 
-async def handle_timeout(message):
-    """;timeout @user <time> [reason]"""
-    no_pings = discord.AllowedMentions.none()
-    guild = message.guild
-    if guild is None:
-        await message.reply("Timeouts only work inside a server.")
-        return
-    if not is_mod(message.author):
-        await message.reply("Only **mods** and **admins** can time people out.")
-        return
-
-    args = message.content.strip().split(maxsplit=3)
-    target = await find_member(guild, args[1]) if len(args) > 1 else None
-    minutes = parse_duration(args[2]) if len(args) > 2 else None
-    if target is None or minutes is None:
-        await message.reply(
-            f"Usage: `{PREFIX}timeout @user <time> [reason]`\n"
-            f"Time examples: `10m` (minutes), `2h` (hours), `3d` (days), `1w` (weeks)"
-        )
-        return
-    problem = check_target(message, target)
+async def do_timeout(guild, author, target, minutes, reason, channel_id):
+    problem = validate(guild, author, target)
     if problem:
-        await message.reply(problem)
-        return
+        return problem, None
     if minutes > MAX_TIMEOUT_MINUTES:
-        await message.reply(
+        return (
             "Discord only allows timeouts up to **28 days** (`4w`), so months aren't possible "
             "for a timeout. Use `4w` or less, or ban the member for something longer."
-        )
-        return
+        ), None
 
-    reason = args[3].strip()[:300] if len(args) > 3 else "No reason given"
     try:
         await target.timeout(
             timedelta(minutes=minutes),
-            reason=f"{reason} (by {message.author})",
+            reason=f"{reason} (by {author})",
         )
     except discord.HTTPException:
-        await message.reply(
+        return (
             "I couldn't time them out. Check that i have the **Moderate Members** permission "
             "and that my role is above theirs."
-        )
-        return
+        ), None
 
     until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
     dm = discord.Embed(title=f"You were timed out in {guild.name}", color=COLOR_WARN)
@@ -400,54 +354,184 @@ async def handle_timeout(message):
 
     embed = discord.Embed(title="⏳ Member timed out", color=COLOR_WARN)
     embed.add_field(name="Member", value=target.mention)
-    embed.add_field(name="By", value=message.author.mention)
+    embed.add_field(name="By", value=author.mention)
     embed.add_field(name="Duration", value=format_duration(minutes))
     embed.add_field(name="Ends", value=discord.utils.format_dt(until, "R"))
     embed.add_field(name="Reason", value=reason, inline=False)
-    await message.reply(embed=embed, allowed_mentions=no_pings)
-    await send_mod_log(guild, embed, message.channel.id)
+    await send_mod_log(guild, embed, channel_id)
+    return None, embed
 
 
-async def handle_untimeout(message):
-    """;untimeout @user"""
-    no_pings = discord.AllowedMentions.none()
-    guild = message.guild
-    if guild is None:
-        await message.reply("Timeouts only work inside a server.")
-        return
-    if not is_mod(message.author):
-        await message.reply("Only **mods** and **admins** can remove timeouts.")
-        return
-
-    args = message.content.strip().split()
-    target = await find_member(guild, args[1]) if len(args) > 1 else None
-    if target is None:
-        await message.reply(f"Usage: `{PREFIX}untimeout @user`")
-        return
+async def do_untimeout(guild, author, target, channel_id):
+    problem = validate(guild, author, target)
+    if problem:
+        return problem, None
 
     try:
-        await target.timeout(None, reason=f"Timeout removed by {message.author}")
+        await target.timeout(None, reason=f"Timeout removed by {author}")
     except discord.HTTPException:
-        await message.reply("I couldn't remove their timeout. Check my **Moderate Members** permission and role position.")
-        return
+        return "I couldn't remove their timeout. Check my **Moderate Members** permission and role position.", None
 
     embed = discord.Embed(
         description=f"Removed the timeout from {target.mention}.",
         color=COLOR_AFK,
     )
-    embed.set_footer(text=f"Removed by {message.author.display_name}")
-    await message.reply(embed=embed, allowed_mentions=no_pings)
-    await send_mod_log(guild, embed, message.channel.id)
+    embed.set_footer(text=f"Removed by {author.display_name}")
+    await send_mod_log(guild, embed, channel_id)
+    return None, embed
 
 
-async def handle_warnings(message):
-    """;warnings [@user] - members can see their own, mods can see anyone's."""
-    no_pings = discord.AllowedMentions.none()
-    guild = message.guild
+def do_warnings(guild, author, user_id):
+    """Members can see their own warnings, mods can see anyone's."""
     if guild is None:
-        await message.reply("Warnings only work inside a server.")
+        return "That only works inside a server.", None
+    if user_id != author.id and not is_mod(author):
+        return "You can only view your own warnings.", None
+
+    rows = get_warnings(guild.id, user_id)
+    member = guild.get_member(user_id)
+    name = member.display_name if member else f"User {user_id}"
+
+    if not rows:
+        return None, discord.Embed(description=f"**{name}** has no warnings.", color=COLOR_AFK)
+
+    lines = []
+    for warn_id, mod_id, reason, created_at, category in rows[-10:]:
+        when = discord.utils.format_dt(datetime.fromisoformat(created_at), "R")
+        tag = "NSFW" if category == "nsfw" else "General"
+        lines.append(f"**#{warn_id}** `{tag}` - {reason[:150]} - by <@{mod_id}> {when}")
+    embed = discord.Embed(
+        title=f"⚠️ Warnings for {name}",
+        description="\n".join(lines),
+        color=COLOR_WARN,
+    )
+    general = sum(1 for row in rows if row[4] != "nsfw")
+    nsfw = len(rows) - general
+    footer = f"General: {general} | NSFW: {nsfw}"
+    if len(rows) > 10:
+        footer += " (showing the latest 10)"
+    embed.set_footer(text=footer)
+    return None, embed
+
+
+async def do_delwarn(guild, author, warn_id, channel_id):
+    problem = validate(guild, author)
+    if problem:
+        return problem, None
+
+    user_id = delete_warning(guild.id, warn_id)
+    if user_id is None:
+        return "I couldn't find a warning with that ID in this server.", None
+
+    remaining = len(get_warnings(guild.id, user_id))
+    embed = discord.Embed(
+        description=(
+            f"Removed warning **#{warn_id}** from <@{user_id}>. "
+            f"They now have **{remaining}** warning{'' if remaining == 1 else 's'}."
+        ),
+        color=COLOR_AFK,
+    )
+    embed.set_footer(text=f"Removed by {author.display_name}")
+    await send_mod_log(guild, embed, channel_id)
+    return None, embed
+
+
+async def do_clearwarns(guild, author, user_id, channel_id):
+    problem = validate(guild, author)
+    if problem:
+        return problem, None
+
+    removed = clear_warnings(guild.id, user_id)
+    embed = discord.Embed(
+        description=f"Cleared **{removed}** warning{'' if removed == 1 else 's'} for <@{user_id}>.",
+        color=COLOR_AFK,
+    )
+    embed.set_footer(text=f"Cleared by {author.display_name}")
+    await send_mod_log(guild, embed, channel_id)
+    return None, embed
+
+
+# ---------------------------------------------------------------------------
+# ;prefix command handlers (they read the message, then call the logic above)
+# ---------------------------------------------------------------------------
+async def reply_result(message, error, embed):
+    if error:
+        await message.reply(error)
+    else:
+        await message.reply(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+
+async def prefix_warn(message):
+    """;warn @user [nsfw] <reason>"""
+    guild = message.guild
+    problem = validate(guild, message.author)
+    if problem:
+        await message.reply(problem)
         return
 
+    args = message.content.strip().split(maxsplit=2)
+    target = await find_member(guild, args[1]) if len(args) > 1 else None
+    if target is None:
+        await message.reply(
+            f"Usage: `{PREFIX}warn @user <reason>` for Promoting / Other servers / Others\n"
+            f"or `{PREFIX}warn @user nsfw <reason>` for NSFW"
+        )
+        return
+
+    # Category: "nsfw" or "general" can be the first word after the user.
+    # With no category word, it counts as Promoting / Other servers / Others.
+    rest = args[2].strip() if len(args) > 2 else ""
+    category = "general"
+    first, _, remainder = rest.partition(" ")
+    if first.lower() in CATEGORY_LABELS:
+        category = first.lower()
+        rest = remainder.strip()
+    reason = rest[:300] or "No reason given"
+
+    error, embed = await do_warn(guild, message.author, target, category, reason, message.channel.id)
+    await reply_result(message, error, embed)
+
+
+async def prefix_to(message):
+    """;to @user <time> [reason]"""
+    guild = message.guild
+    problem = validate(guild, message.author)
+    if problem:
+        await message.reply(problem)
+        return
+
+    args = message.content.strip().split(maxsplit=3)
+    target = await find_member(guild, args[1]) if len(args) > 1 else None
+    minutes = parse_duration(args[2]) if len(args) > 2 else None
+    if target is None or minutes is None:
+        await message.reply(f"Usage: `{PREFIX}to @user <time> [reason]`\n{DURATION_HELP}")
+        return
+
+    reason = args[3].strip()[:300] if len(args) > 3 else "No reason given"
+    error, embed = await do_timeout(guild, message.author, target, minutes, reason, message.channel.id)
+    await reply_result(message, error, embed)
+
+
+async def prefix_rto(message):
+    """;rto @user - removes a timeout"""
+    guild = message.guild
+    problem = validate(guild, message.author)
+    if problem:
+        await message.reply(problem)
+        return
+
+    args = message.content.strip().split()
+    target = await find_member(guild, args[1]) if len(args) > 1 else None
+    if target is None:
+        await message.reply(f"Usage: `{PREFIX}rto @user`")
+        return
+
+    error, embed = await do_untimeout(guild, message.author, target, message.channel.id)
+    await reply_result(message, error, embed)
+
+
+async def prefix_warnings(message):
+    """;warnings [@user]"""
     args = message.content.strip().split()
     if len(args) > 1:
         found = USER_ID_RE.search(args[1])
@@ -458,45 +542,15 @@ async def handle_warnings(message):
     else:
         user_id = message.author.id
 
-    if user_id != message.author.id and not is_mod(message.author):
-        await message.reply("You can only view your own warnings.")
-        return
-
-    rows = get_warnings(guild.id, user_id)
-    member = guild.get_member(user_id)
-    name = member.display_name if member else f"User {user_id}"
-
-    if not rows:
-        embed = discord.Embed(description=f"**{name}** has no warnings.", color=COLOR_AFK)
-    else:
-        lines = []
-        for warn_id, mod_id, reason, created_at, category in rows[-10:]:
-            when = discord.utils.format_dt(datetime.fromisoformat(created_at), "R")
-            tag = "NSFW" if category == "nsfw" else "General"
-            lines.append(f"**#{warn_id}** `{tag}` - {reason[:150]} - by <@{mod_id}> {when}")
-        embed = discord.Embed(
-            title=f"⚠️ Warnings for {name}",
-            description="\n".join(lines),
-            color=COLOR_WARN,
-        )
-        general = sum(1 for row in rows if row[4] != "nsfw")
-        nsfw = len(rows) - general
-        footer = f"General: {general} | NSFW: {nsfw}"
-        if len(rows) > 10:
-            footer += " (showing the latest 10)"
-        embed.set_footer(text=footer)
-    await message.reply(embed=embed, allowed_mentions=no_pings)
+    error, embed = do_warnings(message.guild, message.author, user_id)
+    await reply_result(message, error, embed)
 
 
-async def handle_delwarn(message):
+async def prefix_delwarn(message):
     """;delwarn <warning id>"""
-    no_pings = discord.AllowedMentions.none()
-    guild = message.guild
-    if guild is None:
-        await message.reply("Warnings only work inside a server.")
-        return
-    if not is_mod(message.author):
-        await message.reply("Only **mods** and **admins** can remove warnings.")
+    problem = validate(message.guild, message.author)
+    if problem:
+        await message.reply(problem)
         return
 
     args = message.content.strip().split()
@@ -504,34 +558,15 @@ async def handle_delwarn(message):
         await message.reply(f"Usage: `{PREFIX}delwarn <warning id>` (the ID is shown in `{PREFIX}warnings`)")
         return
 
-    warn_id = int(args[1])
-    user_id = delete_warning(guild.id, warn_id)
-    if user_id is None:
-        await message.reply("I couldn't find a warning with that ID in this server.")
-        return
-
-    remaining = len(get_warnings(guild.id, user_id))
-    embed = discord.Embed(
-        description=(
-            f"Removed warning **#{warn_id}** from <@{user_id}>. "
-            f"They now have **{remaining}** warning{'' if remaining == 1 else 's'}."
-        ),
-        color=COLOR_AFK,
-    )
-    embed.set_footer(text=f"Removed by {message.author.display_name}")
-    await message.reply(embed=embed, allowed_mentions=no_pings)
-    await send_mod_log(guild, embed, message.channel.id)
+    error, embed = await do_delwarn(message.guild, message.author, int(args[1]), message.channel.id)
+    await reply_result(message, error, embed)
 
 
-async def handle_clearwarns(message):
+async def prefix_clearwarns(message):
     """;clearwarns @user"""
-    no_pings = discord.AllowedMentions.none()
-    guild = message.guild
-    if guild is None:
-        await message.reply("Warnings only work inside a server.")
-        return
-    if not is_mod(message.author):
-        await message.reply("Only **mods** and **admins** can clear warnings.")
+    problem = validate(message.guild, message.author)
+    if problem:
+        await message.reply(problem)
         return
 
     args = message.content.strip().split()
@@ -540,15 +575,8 @@ async def handle_clearwarns(message):
         await message.reply(f"Usage: `{PREFIX}clearwarns @user`")
         return
 
-    user_id = int(found.group())
-    removed = clear_warnings(guild.id, user_id)
-    embed = discord.Embed(
-        description=f"Cleared **{removed}** warning{'' if removed == 1 else 's'} for <@{user_id}>.",
-        color=COLOR_AFK,
-    )
-    embed.set_footer(text=f"Cleared by {message.author.display_name}")
-    await message.reply(embed=embed, allowed_mentions=no_pings)
-    await send_mod_log(guild, embed, message.channel.id)
+    error, embed = await do_clearwarns(message.guild, message.author, int(found.group()), message.channel.id)
+    await reply_result(message, error, embed)
 
 
 # ---------------------------------------------------------------------------
@@ -567,10 +595,12 @@ def build_help_embed(bot_user):
         "**🛡️ Moderation (mods/admins only):**\n"
         f"`{PREFIX}warn @user <reason>` - Warns for Promoting / Other servers / Others.\n"
         f"`{PREFIX}warn @user nsfw <reason>` - Warns for NSFW.\n"
-        f"`{PREFIX}timeout @user <time> [reason]` - Times someone out (`10m`, `2h`, `3d`, `1w`).\n"
-        f"`{PREFIX}untimeout @user` - Removes a timeout.\n"
+        f"`{PREFIX}to @user <time> [reason]` - Times someone out (`10m`, `2h`, `3d`, `1w`).\n"
+        f"`{PREFIX}rto @user` - Removes a timeout.\n"
         f"`{PREFIX}delwarn <id>` - Removes one warning.\n"
         f"`{PREFIX}clearwarns @user` - Clears all of a member's warnings.\n"
+        "\n"
+        "**⚡ Slash versions:** `/warn`, `/to`, `/rto`, `/warnings`, `/delwarn`, `/clearwarns`\n"
         "\n"
         "**🤖 Chat:**\n"
         "`@mention` - Mention me with a question and i'll answer.\n"
@@ -701,27 +731,27 @@ class Client(discord.Client):
 
         # Moderation commands
         if command == f"{PREFIX}warn":
-            await handle_warn(message)
+            await prefix_warn(message)
             return
 
-        if command == f"{PREFIX}timeout":
-            await handle_timeout(message)
+        if command == f"{PREFIX}to":
+            await prefix_to(message)
             return
 
-        if command == f"{PREFIX}untimeout":
-            await handle_untimeout(message)
+        if command == f"{PREFIX}rto":
+            await prefix_rto(message)
             return
 
         if command == f"{PREFIX}warnings":
-            await handle_warnings(message)
+            await prefix_warnings(message)
             return
 
         if command == f"{PREFIX}delwarn":
-            await handle_delwarn(message)
+            await prefix_delwarn(message)
             return
 
         if command == f"{PREFIX}clearwarns":
-            await handle_clearwarns(message)
+            await prefix_clearwarns(message)
             return
 
         # Prefix commands like ;reset and ;summarize
@@ -788,7 +818,23 @@ intents.message_content = True  # needed so the bot can read message text
 clients = Client(intents=intents)
 
 
-# Slash command versions
+# ---------------------------------------------------------------------------
+# Slash commands
+# ---------------------------------------------------------------------------
+RULE_CHOICES = [
+    app_commands.Choice(name=label, value=key)
+    for key, label in CATEGORY_LABELS.items()
+]
+
+
+async def slash_finish(interaction, error, embed):
+    """Sends the result of a slash command that already used defer()."""
+    if error:
+        await interaction.followup.send(error)
+    else:
+        await interaction.followup.send(embed=embed)
+
+
 @clients.tree.command(name="reset", description="Clear the AI's memory for this channel (mods/admins only)")
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_messages=True)
@@ -809,4 +855,121 @@ async def summarize(interaction: discord.Interaction):
     await interaction.followup.send(summary)
 
 
-clients.run("BOT_TOKEN") 
+@clients.tree.command(name="warn", description="Warn a member (mods/admins only)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(
+    member="Who to warn",
+    reason="Why they're being warned",
+    rule="Which rule they broke (leave empty for Promoting / Other servers / Others)",
+)
+@app_commands.choices(rule=RULE_CHOICES)
+async def slash_warn(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str,
+    rule: app_commands.Choice[str] = None,
+):
+    problem = validate(interaction.guild, interaction.user, member)
+    if problem:
+        await interaction.response.send_message(problem, ephemeral=True)
+        return
+    await interaction.response.defer()
+    category = rule.value if rule else "general"
+    error, embed = await do_warn(
+        interaction.guild, interaction.user, member, category, reason[:300], interaction.channel_id
+    )
+    await slash_finish(interaction, error, embed)
+
+
+@clients.tree.command(name="to", description="Time a member out (mods/admins only)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(
+    member="Who to time out",
+    duration="How long: 10m, 2h, 3d or 1w (max 28 days)",
+    reason="Why they're being timed out",
+)
+async def slash_to(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    duration: str,
+    reason: str = "No reason given",
+):
+    problem = validate(interaction.guild, interaction.user, member)
+    if problem:
+        await interaction.response.send_message(problem, ephemeral=True)
+        return
+    minutes = parse_duration(duration)
+    if minutes is None:
+        await interaction.response.send_message(DURATION_HELP, ephemeral=True)
+        return
+    await interaction.response.defer()
+    error, embed = await do_timeout(
+        interaction.guild, interaction.user, member, minutes, reason[:300], interaction.channel_id
+    )
+    await slash_finish(interaction, error, embed)
+
+
+@clients.tree.command(name="rto", description="Remove a member's timeout (mods/admins only)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(member="Whose timeout to remove")
+async def slash_rto(interaction: discord.Interaction, member: discord.Member):
+    problem = validate(interaction.guild, interaction.user, member)
+    if problem:
+        await interaction.response.send_message(problem, ephemeral=True)
+        return
+    await interaction.response.defer()
+    error, embed = await do_untimeout(
+        interaction.guild, interaction.user, member, interaction.channel_id
+    )
+    await slash_finish(interaction, error, embed)
+
+
+@clients.tree.command(name="warnings", description="Show warnings (yours, or anyone's if you're a mod)")
+@app_commands.guild_only()
+@app_commands.describe(user="Whose warnings to show (leave empty for yours)")
+async def slash_warnings(interaction: discord.Interaction, user: discord.User = None):
+    target_id = user.id if user else interaction.user.id
+    error, embed = do_warnings(interaction.guild, interaction.user, target_id)
+    # Only visible to the person who asked, so warnings stay private
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@clients.tree.command(name="delwarn", description="Remove one warning by its ID (mods/admins only)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(warning_id="The warning ID shown in /warnings")
+async def slash_delwarn(interaction: discord.Interaction, warning_id: int):
+    problem = validate(interaction.guild, interaction.user)
+    if problem:
+        await interaction.response.send_message(problem, ephemeral=True)
+        return
+    await interaction.response.defer()
+    error, embed = await do_delwarn(
+        interaction.guild, interaction.user, warning_id, interaction.channel_id
+    )
+    await slash_finish(interaction, error, embed)
+
+
+@clients.tree.command(name="clearwarns", description="Clear all of a member's warnings (mods/admins only)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(user="Whose warnings to clear")
+async def slash_clearwarns(interaction: discord.Interaction, user: discord.User):
+    problem = validate(interaction.guild, interaction.user)
+    if problem:
+        await interaction.response.send_message(problem, ephemeral=True)
+        return
+    await interaction.response.defer()
+    error, embed = await do_clearwarns(
+        interaction.guild, interaction.user, user.id, interaction.channel_id
+    )
+    await slash_finish(interaction, error, embed)
+
+
+clients.run("PASTE_BOT_TOKEN_HERE")
