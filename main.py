@@ -51,7 +51,7 @@ SYSTEM_PROMPT = (
 
 MODEL = "gemini-3.5-flash-lite"
 
-ai = genai.Client(api_key="GEMINI_API_KEY")
+ai = genai.Client(api_key="GEMINI_API_KEY_HERE")
 chats = {}  # channel id -> chat session (remembers history)
 afk = {}    # user id -> (reason, time they went afk)
 
@@ -580,7 +580,7 @@ async def prefix_clearwarns(message):
 
 
 # ---------------------------------------------------------------------------
-# Help and summary
+# Help command
 # ---------------------------------------------------------------------------
 def build_help_embed(bot_user):
     """Builds the ;help embed."""
