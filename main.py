@@ -7,13 +7,14 @@ from discord import app_commands
 from google import genai
 from google.genai import types
 
-PREFIX = ";"  # change this to , or ! or . if you want a different symbol
+PREFIX = "?"  # change this to , or ! or . if you want a different symbol
 
 # Bot status: shows as "Listening to ..." and rotates through this list.
 # {servers} is replaced by the server count if you ever want to use it.
 STATUSES = [
     ".gg/noxity",
-    ";help",
+    "NOXITY ON TOP",
+    "?help",
 ]
 STATUS_INTERVAL = 60  # seconds between changes (60 = 1 minute)
 
@@ -119,16 +120,9 @@ def get_warnings(guild_id, user_id):
 
 
 def delete_warning(guild_id, warn_id):
-    """Deletes one warning. Returns the warned user's id, or None if not found."""
-    row = db.execute(
-        "SELECT user_id FROM warnings WHERE id = ? AND guild_id = ?",
-        (warn_id, guild_id),
-    ).fetchone()
-    if row is None:
-        return None
+    """Deletes one warning by its database id."""
     db.execute("DELETE FROM warnings WHERE id = ? AND guild_id = ?", (warn_id, guild_id))
     db.commit()
-    return row[0]
 
 
 def clear_warnings(guild_id, user_id):
@@ -239,6 +233,23 @@ async def find_member(guild, text):
         except discord.HTTPException:
             return None
     return member
+
+
+async def get_display_name(guild, user_id):
+    """Gets a user's display name, even if they're not in the bot's cache or have left the server."""
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except discord.HTTPException:
+            member = None
+    if member is not None:
+        return member.display_name
+    try:
+        user = await clients.fetch_user(user_id)
+        return user.display_name
+    except discord.HTTPException:
+        return f"User {user_id}"
 
 
 async def try_dm(user, embed):
@@ -381,7 +392,59 @@ async def do_untimeout(guild, author, target, channel_id):
     return None, embed
 
 
-def do_warnings(guild, author, user_id):
+async def do_kick(guild, author, target, reason, channel_id):
+    problem = validate(guild, author, target)
+    if problem:
+        return problem, None
+
+    # DM first, since they can't be messaged after they're kicked
+    dm = discord.Embed(title=f"You were kicked from {guild.name}", color=COLOR_WARN)
+    dm.add_field(name="Reason", value=reason, inline=False)
+    await try_dm(target, dm)
+
+    try:
+        await target.kick(reason=f"{reason} (by {author})")
+    except discord.HTTPException:
+        return (
+            "I couldn't kick them. Check that i have the **Kick Members** permission "
+            "and that my role is above theirs."
+        ), None
+
+    embed = discord.Embed(title="👢 Member kicked", color=COLOR_WARN)
+    embed.add_field(name="Member", value=f"{target.mention} ({target})")
+    embed.add_field(name="By", value=author.mention)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    await send_mod_log(guild, embed, channel_id)
+    return None, embed
+
+
+async def do_ban(guild, author, target, reason, channel_id):
+    problem = validate(guild, author, target)
+    if problem:
+        return problem, None
+
+    # DM first, since they can't be messaged after they're banned
+    dm = discord.Embed(title=f"You were banned from {guild.name}", color=COLOR_WARN)
+    dm.add_field(name="Reason", value=reason, inline=False)
+    await try_dm(target, dm)
+
+    try:
+        await target.ban(reason=f"{reason} (by {author})", delete_message_seconds=0)
+    except discord.HTTPException:
+        return (
+            "I couldn't ban them. Check that i have the **Ban Members** permission "
+            "and that my role is above theirs."
+        ), None
+
+    embed = discord.Embed(title="🔨 Member banned", color=COLOR_WARN)
+    embed.add_field(name="Member", value=f"{target.mention} ({target})")
+    embed.add_field(name="By", value=author.mention)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    await send_mod_log(guild, embed, channel_id)
+    return None, embed
+
+
+async def do_warnings(guild, author, user_id):
     """Members can see their own warnings, mods can see anyone's."""
     if guild is None:
         return "That only works inside a server.", None
@@ -389,17 +452,18 @@ def do_warnings(guild, author, user_id):
         return "You can only view your own warnings.", None
 
     rows = get_warnings(guild.id, user_id)
-    member = guild.get_member(user_id)
-    name = member.display_name if member else f"User {user_id}"
+    name = await get_display_name(guild, user_id)
 
     if not rows:
         return None, discord.Embed(description=f"**{name}** has no warnings.", color=COLOR_AFK)
 
     lines = []
-    for warn_id, mod_id, reason, created_at, category in rows[-10:]:
+    start = max(0, len(rows) - 10)  # show the latest 10, but keep their real numbers
+    for number in range(start, len(rows)):
+        _, mod_id, reason, created_at, category = rows[number]
         when = discord.utils.format_dt(datetime.fromisoformat(created_at), "R")
         tag = "NSFW" if category == "nsfw" else "General"
-        lines.append(f"**#{warn_id}** `{tag}` - {reason[:150]} - by <@{mod_id}> {when}")
+        lines.append(f"**{number + 1}.** `{tag}` - {reason[:150]} - by <@{mod_id}> {when}")
     embed = discord.Embed(
         title=f"⚠️ Warnings for {name}",
         description="\n".join(lines),
@@ -407,26 +471,34 @@ def do_warnings(guild, author, user_id):
     )
     general = sum(1 for row in rows if row[4] != "nsfw")
     nsfw = len(rows) - general
-    footer = f"General: {general} | NSFW: {nsfw}"
+    footer = f"General: {general} | NSFW: {nsfw} | Remove one with ;delwarn @user <number>"
     if len(rows) > 10:
-        footer += " (showing the latest 10)"
+        footer += " | showing the latest 10"
     embed.set_footer(text=footer)
     return None, embed
 
 
-async def do_delwarn(guild, author, warn_id, channel_id):
-    problem = validate(guild, author)
+async def do_delwarn(guild, author, target, number, channel_id):
+    problem = validate(guild, author, target)
     if problem:
         return problem, None
 
-    user_id = delete_warning(guild.id, warn_id)
-    if user_id is None:
-        return "I couldn't find a warning with that ID in this server.", None
+    rows = get_warnings(guild.id, target.id)
+    if not rows:
+        return f"{target.display_name} doesn't have any warnings.", None
+    if number < 1 or number > len(rows):
+        return (
+            f"{target.display_name} has {len(rows)} warning{'' if len(rows) == 1 else 's'}. "
+            f"Pick a number from 1 to {len(rows)} (see `{PREFIX}warns @user`)."
+        ), None
 
-    remaining = len(get_warnings(guild.id, user_id))
+    warn_id = rows[number - 1][0]
+    delete_warning(guild.id, warn_id)
+
+    remaining = len(rows) - 1
     embed = discord.Embed(
         description=(
-            f"Removed warning **#{warn_id}** from <@{user_id}>. "
+            f"Removed warning **#{number}** from {target.mention}. "
             f"They now have **{remaining}** warning{'' if remaining == 1 else 's'}."
         ),
         color=COLOR_AFK,
@@ -530,35 +602,78 @@ async def prefix_rto(message):
     await reply_result(message, error, embed)
 
 
-async def prefix_warnings(message):
-    """;warnings [@user]"""
+async def prefix_kick(message):
+    """;kick @user [reason]"""
+    guild = message.guild
+    problem = validate(guild, message.author)
+    if problem:
+        await message.reply(problem)
+        return
+
+    args = message.content.strip().split(maxsplit=2)
+    target = await find_member(guild, args[1]) if len(args) > 1 else None
+    if target is None:
+        await message.reply(f"Usage: `{PREFIX}kick @user [reason]`")
+        return
+
+    reason = args[2].strip()[:300] if len(args) > 2 else "No reason given"
+    error, embed = await do_kick(guild, message.author, target, reason, message.channel.id)
+    await reply_result(message, error, embed)
+
+
+async def prefix_ban(message):
+    """;ban @user [reason]"""
+    guild = message.guild
+    problem = validate(guild, message.author)
+    if problem:
+        await message.reply(problem)
+        return
+
+    args = message.content.strip().split(maxsplit=2)
+    target = await find_member(guild, args[1]) if len(args) > 1 else None
+    if target is None:
+        await message.reply(f"Usage: `{PREFIX}ban @user [reason]`")
+        return
+
+    reason = args[2].strip()[:300] if len(args) > 2 else "No reason given"
+    error, embed = await do_ban(guild, message.author, target, reason, message.channel.id)
+    await reply_result(message, error, embed)
+
+
+async def prefix_warns(message):
+    """;warns [@user]"""
     args = message.content.strip().split()
     if len(args) > 1:
         found = USER_ID_RE.search(args[1])
         if not found:
-            await message.reply(f"Usage: `{PREFIX}warnings [@user]`")
+            await message.reply(f"Usage: `{PREFIX}warns [@user]`")
             return
         user_id = int(found.group())
     else:
         user_id = message.author.id
 
-    error, embed = do_warnings(message.guild, message.author, user_id)
+    error, embed = await do_warnings(message.guild, message.author, user_id)
     await reply_result(message, error, embed)
 
 
 async def prefix_delwarn(message):
-    """;delwarn <warning id>"""
+    """;delwarn @user <number>"""
     problem = validate(message.guild, message.author)
     if problem:
         await message.reply(problem)
         return
 
     args = message.content.strip().split()
-    if len(args) < 2 or not args[1].isdigit():
-        await message.reply(f"Usage: `{PREFIX}delwarn <warning id>` (the ID is shown in `{PREFIX}warnings`)")
+    target = await find_member(message.guild, args[1]) if len(args) > 1 else None
+    number = int(args[2]) if len(args) > 2 and args[2].isdigit() else None
+    if target is None or number is None:
+        await message.reply(
+            f"Usage: `{PREFIX}delwarn @user <number>`\n"
+            f"The number is the warning's position in `{PREFIX}warns @user`."
+        )
         return
 
-    error, embed = await do_delwarn(message.guild, message.author, int(args[1]), message.channel.id)
+    error, embed = await do_delwarn(message.guild, message.author, target, number, message.channel.id)
     await reply_result(message, error, embed)
 
 
@@ -580,7 +695,7 @@ async def prefix_clearwarns(message):
 
 
 # ---------------------------------------------------------------------------
-# Help command
+# Help and summary
 # ---------------------------------------------------------------------------
 def build_help_embed(bot_user):
     """Builds the ;help embed."""
@@ -590,14 +705,16 @@ def build_help_embed(bot_user):
         f"`{PREFIX}afk <reason>` - Marks you as away. The bot tells anyone who pings you.\n"
         f"`{PREFIX}summarize` - Summarizes the last 50 messages in the channel.\n"
         f"`{PREFIX}reset` - Clears my memory in this channel.\n"
-        f"`{PREFIX}warnings [@user]` - Shows your warnings. Mods can check anyone.\n"
+        f"`{PREFIX}warns [@user]` - Shows your warnings. Mods can check anyone.\n"
         "\n"
         "**🛡️ Moderation:**\n"
         f"`{PREFIX}warn @user <reason>` - Warns for Promoting / Other servers / Others.\n"
         f"`{PREFIX}warn @user nsfw <reason>` - Warns for NSFW.\n"
         f"`{PREFIX}to @user <time> [reason]` - Times someone out (`10m`, `2h`, `3d`, `1w`).\n"
         f"`{PREFIX}rto @user` - Removes a timeout.\n"
-        f"`{PREFIX}delwarn <id>` - Removes one warning.\n"
+        f"`{PREFIX}kick @user [reason]` - Kicks a member from the server.\n"
+        f"`{PREFIX}ban @user [reason]` - Bans a member from the server.\n"
+        f"`{PREFIX}delwarn @user <number>` - Removes one of their warnings (number from `{PREFIX}warns`).\n"
         f"`{PREFIX}clearwarns @user` - Clears all of a member's warnings.\n"
         "\n"
         "**🤖 Chat:**\n"
@@ -740,8 +857,16 @@ class Client(discord.Client):
             await prefix_rto(message)
             return
 
-        if command == f"{PREFIX}warnings":
-            await prefix_warnings(message)
+        if command == f"{PREFIX}kick":
+            await prefix_kick(message)
+            return
+
+        if command == f"{PREFIX}ban":
+            await prefix_ban(message)
+            return
+
+        if command == f"{PREFIX}warns":
+            await prefix_warns(message)
             return
 
         if command == f"{PREFIX}delwarn":
@@ -925,12 +1050,58 @@ async def slash_rto(interaction: discord.Interaction, member: discord.Member):
     await slash_finish(interaction, error, embed)
 
 
-@clients.tree.command(name="warnings", description="Show warnings (yours, or anyone's if you're a mod)")
+@clients.tree.command(name="kick", description="Kick a member from the server (mods/admins only)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(
+    member="Who to kick",
+    reason="Why they're being kicked",
+)
+async def slash_kick(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason given",
+):
+    problem = validate(interaction.guild, interaction.user, member)
+    if problem:
+        await interaction.response.send_message(problem, ephemeral=True)
+        return
+    await interaction.response.defer()
+    error, embed = await do_kick(
+        interaction.guild, interaction.user, member, reason[:300], interaction.channel_id
+    )
+    await slash_finish(interaction, error, embed)
+
+
+@clients.tree.command(name="ban", description="Ban a member from the server (mods/admins only)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(
+    member="Who to ban",
+    reason="Why they're being banned",
+)
+async def slash_ban(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason given",
+):
+    problem = validate(interaction.guild, interaction.user, member)
+    if problem:
+        await interaction.response.send_message(problem, ephemeral=True)
+        return
+    await interaction.response.defer()
+    error, embed = await do_ban(
+        interaction.guild, interaction.user, member, reason[:300], interaction.channel_id
+    )
+    await slash_finish(interaction, error, embed)
+
+
+@clients.tree.command(name="warns", description="Show warnings (yours, or anyone's if you're a mod)")
 @app_commands.guild_only()
 @app_commands.describe(user="Whose warnings to show (leave empty for yours)")
-async def slash_warnings(interaction: discord.Interaction, user: discord.User = None):
+async def slash_warns(interaction: discord.Interaction, user: discord.User = None):
     target_id = user.id if user else interaction.user.id
-    error, embed = do_warnings(interaction.guild, interaction.user, target_id)
+    error, embed = await do_warnings(interaction.guild, interaction.user, target_id)
     # Only visible to the person who asked, so warnings stay private
     if error:
         await interaction.response.send_message(error, ephemeral=True)
@@ -938,18 +1109,21 @@ async def slash_warnings(interaction: discord.Interaction, user: discord.User = 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@clients.tree.command(name="delwarn", description="Remove one warning by its ID (mods/admins only)")
+@clients.tree.command(name="delwarn", description="Remove one of a member's warnings by its number (mods/admins only)")
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_messages=True)
-@app_commands.describe(warning_id="The warning ID shown in /warnings")
-async def slash_delwarn(interaction: discord.Interaction, warning_id: int):
-    problem = validate(interaction.guild, interaction.user)
+@app_commands.describe(
+    member="Whose warning to remove",
+    number="The warning's number, as shown in /warns",
+)
+async def slash_delwarn(interaction: discord.Interaction, member: discord.Member, number: int):
+    problem = validate(interaction.guild, interaction.user, member)
     if problem:
         await interaction.response.send_message(problem, ephemeral=True)
         return
     await interaction.response.defer()
     error, embed = await do_delwarn(
-        interaction.guild, interaction.user, warning_id, interaction.channel_id
+        interaction.guild, interaction.user, member, number, interaction.channel_id
     )
     await slash_finish(interaction, error, embed)
 
