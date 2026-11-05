@@ -7,7 +7,7 @@ from discord import app_commands
 from google import genai
 from google.genai import types
 
-PREFIX = "?"  # change this to , or ! or . if you want a different symbol
+PREFIX = "?"
 
 # Bot status: shows as "Listening to ..." and rotates through this list.
 # {servers} is replaced by the server count if you ever want to use it.
@@ -23,12 +23,11 @@ STATUS_INTERVAL = 60  # seconds between changes (60 = 1 minute)
 # ---------------------------------------------------------------------------
 MOD_LOG_CHANNEL_ID = 0  # paste a channel ID here to log every warning/timeout there
 DB_FILE = "warnings.db"
-AUTO_BAN = True  # False = the bot won't ban on the 5th offense, it just tells you to review
+AUTO_BAN = True  # False = the bot won't ban on the 5th offense, it just tells to review
 
 # What each offense does, per category. Numbers are minutes of timeout.
 #   None  = reminder only (no action)
 #   "ban" = ban
-# After the last step, any further offense repeats the last step.
 CATEGORY_LABELS = {
     "general": "Promoting / Mentioning other servers / Others",
     "nsfw": "NSFW",
@@ -52,13 +51,13 @@ SYSTEM_PROMPT = (
 
 MODEL = "gemini-3.5-flash-lite"
 
-ai = genai.Client(api_key="GEMINI_API_KEY_HERE")
+ai = genai.Client(api_key="GEMINI_API_KEY")
 chats = {}  # channel id -> chat session (remembers history)
 afk = {}    # user id -> (reason, time they went afk)
 
-# Embed colors
-COLOR_AFK = discord.Color(0x4F545C)  # gray
-COLOR_WARN = discord.Color(0x010101)  # black (see note: pure 000000 can show as "no color")
+# Embed colors (all black)
+COLOR_AFK = discord.Color(0x010101)   # black
+COLOR_WARN = discord.Color(0x010101)  # black
 
 # Words to watch for -> emoji to react with
 REACTIONS = {
@@ -80,7 +79,7 @@ REACTIONS = {
 }
 
 # ---------------------------------------------------------------------------
-# Warning database (a small file saved next to main.py)
+# Warning database
 # ---------------------------------------------------------------------------
 db = sqlite3.connect(DB_FILE)
 db.execute(
@@ -94,7 +93,7 @@ db.execute(
         category TEXT NOT NULL DEFAULT 'general'
     )"""
 )
-# Upgrade older database files that don't have the category column yet
+
 _columns = [row[1] for row in db.execute("PRAGMA table_info(warnings)")]
 if "category" not in _columns:
     db.execute("ALTER TABLE warnings ADD COLUMN category TEXT NOT NULL DEFAULT 'general'")
@@ -235,6 +234,30 @@ async def find_member(guild, text):
     return member
 
 
+def parse_user_id(text):
+    """Returns the user ID as an int if the text is a plain Discord ID, else None."""
+    text = text.strip()
+    return int(text) if re.fullmatch(r"\d{15,20}", text) else None
+
+
+def find_role(guild, text):
+    """Finds a role from a mention, an ID, or a name (exact or partial, case-insensitive)."""
+    text = text.strip()
+    found = re.fullmatch(r"<@&(\d{15,20})>|(\d{15,20})", text)
+    if found:
+        return guild.get_role(int(found.group(1) or found.group(2)))
+
+    name = text.lstrip("@").strip().lower()
+    if not name:
+        return None
+    roles = [r for r in guild.roles if not r.is_default()]
+    exact = [r for r in roles if r.name.lower() == name]
+    if exact:
+        return exact[0]
+    partial = [r for r in roles if name in r.name.lower()]
+    return partial[0] if len(partial) == 1 else None
+
+
 async def get_display_name(guild, user_id):
     """Gets a user's display name, even if they're not in the bot's cache or have left the server."""
     member = guild.get_member(user_id)
@@ -272,10 +295,6 @@ async def send_mod_log(guild, embed, current_channel_id):
         pass
 
 
-# ---------------------------------------------------------------------------
-# Moderation logic (shared by the ;prefix commands and the /slash commands)
-# Each function returns (error_text, embed). One of them is always None.
-# ---------------------------------------------------------------------------
 async def do_warn(guild, author, target, category, reason, channel_id):
     problem = validate(guild, author, target)
     if problem:
@@ -342,8 +361,7 @@ async def do_timeout(guild, author, target, minutes, reason, channel_id):
         return problem, None
     if minutes > MAX_TIMEOUT_MINUTES:
         return (
-            "Discord only allows timeouts up to **28 days** (`4w`), so months aren't possible "
-            "for a timeout. Use `4w` or less, or ban the member for something longer."
+            "Timeouts up to **28 days** only. "
         ), None
 
     try:
@@ -440,6 +458,72 @@ async def do_ban(guild, author, target, reason, channel_id):
     embed.add_field(name="Member", value=f"{target.mention} ({target})")
     embed.add_field(name="By", value=author.mention)
     embed.add_field(name="Reason", value=reason, inline=False)
+    await send_mod_log(guild, embed, channel_id)
+    return None, embed
+
+
+async def do_unban(guild, author, user_id, channel_id):
+    problem = validate(guild, author)
+    if problem:
+        return problem, None
+
+    try:
+        ban_entry = await guild.fetch_ban(discord.Object(id=user_id))
+    except discord.NotFound:
+        return "That user isn't banned.", None
+    except discord.HTTPException:
+        return "I couldn't check the ban list. Make sure i have the **Ban Members** permission.", None
+
+    user = ban_entry.user
+    try:
+        await guild.unban(user, reason=f"Unbanned by {author}")
+    except discord.HTTPException:
+        return "I couldn't unban them. Check that i have the **Ban Members** permission.", None
+
+    embed = discord.Embed(title="✅ Member unbanned", color=COLOR_AFK)
+    embed.add_field(name="User", value=f"{user} (`{user.id}`)")
+    embed.add_field(name="By", value=author.mention)
+    if ban_entry.reason:
+        embed.add_field(name="Original ban reason", value=ban_entry.reason[:300], inline=False)
+    await send_mod_log(guild, embed, channel_id)
+    return None, embed
+
+
+async def do_role(guild, author, target, role, channel_id):
+    """Gives the role if they don't have it, removes it if they do. Returns (error, embed)."""
+    problem = validate(guild, author, target)
+    if problem:
+        return problem, None
+    if role.is_default() or role.managed:
+        return "I can't give or remove that role.", None
+    if author.id != guild.owner_id and role >= author.top_role:
+        return "That role is the same as or higher than your top role.", None
+    if role >= guild.me.top_role:
+        return "That role is the same as or higher than my top role, so i can't manage it.", None
+
+    reason = f"Role toggled by {author}"
+    try:
+        if role in target.roles:
+            await target.remove_roles(role, reason=reason)
+            embed = discord.Embed(
+                title="🏷️ Role removed",
+                description=f"Removed **{role.name}** from {target.mention}.",
+                color=COLOR_AFK,
+            )
+        else:
+            await target.add_roles(role, reason=reason)
+            embed = discord.Embed(
+                title="🏷️ Role given",
+                description=f"Gave **{role.name}** to {target.mention}.",
+                color=COLOR_AFK,
+            )
+    except discord.HTTPException:
+        return "I couldn't change their roles. Check my **Manage Roles** permission and role position.", None
+
+    embed.add_field(name="Member", value=f"{target.mention} ({target})")
+    embed.add_field(name="Role", value=role.mention)
+    embed.add_field(name="By", value=author.mention)
+    embed.set_footer(text=f"Changed by {author.display_name}")
     await send_mod_log(guild, embed, channel_id)
     return None, embed
 
@@ -640,6 +724,50 @@ async def prefix_ban(message):
     await reply_result(message, error, embed)
 
 
+async def prefix_unban(message):
+    """;unban <user id>"""
+    problem = validate(message.guild, message.author)
+    if problem:
+        await message.reply(problem)
+        return
+
+    args = message.content.strip().split()
+    user_id = parse_user_id(args[1]) if len(args) > 1 else None
+    if user_id is None:
+        await message.reply(f"Usage: `{PREFIX}unban <user id>`")
+        return
+
+    error, embed = await do_unban(message.guild, message.author, user_id, message.channel.id)
+    await reply_result(message, error, embed)
+
+
+async def prefix_role(message):
+    """;role @user <role name, mention, or ID>"""
+    problem = validate(message.guild, message.author)
+    if problem:
+        await message.reply(problem)
+        return
+
+    args = message.content.strip().split(maxsplit=2)
+    target = await find_member(message.guild, args[1]) if len(args) > 1 else None
+    role = find_role(message.guild, args[2]) if len(args) > 2 else None
+    if target is None or role is None:
+        await message.reply(
+            f"Usage: `{PREFIX}role @user <rolename>`)"
+        )
+        return
+
+    error, embed = await do_role(message.guild, message.author, target, role, message.channel.id)
+    if error:
+        await message.reply(error)
+        return
+    await message.reply(
+        target.mention,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(users=[target], roles=False, everyone=False, replied_user=False),
+    )
+
+
 async def prefix_warns(message):
     """;warns [@user]"""
     args = message.content.strip().split()
@@ -669,7 +797,6 @@ async def prefix_delwarn(message):
     if target is None or number is None:
         await message.reply(
             f"Usage: `{PREFIX}delwarn @user <number>`\n"
-            f"The number is the warning's position in `{PREFIX}warns @user`."
         )
         return
 
@@ -695,39 +822,73 @@ async def prefix_clearwarns(message):
 
 
 # ---------------------------------------------------------------------------
-# Help and summary
+# Help command: front page with COMMANDS / MODERATIONS buttons
 # ---------------------------------------------------------------------------
-def build_help_embed(bot_user):
-    """Builds the ;help embed."""
-    description = (
-        "**📌 Commands:**\n"
-        f"`{PREFIX}help` - Shows this help message.\n"
-        f"`{PREFIX}afk <reason>` - Marks you as away. The bot tells anyone who pings you.\n"
-        f"`{PREFIX}summarize` - Summarizes the last 50 messages in the channel.\n"
-        f"`{PREFIX}reset` - Clears my memory in this channel.\n"
-        f"`{PREFIX}warns [@user]` - Shows your warnings. Mods can check anyone.\n"
-        "\n"
-        "**🛡️ Moderation:**\n"
-        f"`{PREFIX}warn @user <reason>` - Warns for Promoting / Other servers / Others.\n"
-        f"`{PREFIX}warn @user nsfw <reason>` - Warns for NSFW.\n"
-        f"`{PREFIX}to @user <time> [reason]` - Times someone out (`10m`, `2h`, `3d`, `1w`).\n"
-        f"`{PREFIX}rto @user` - Removes a timeout.\n"
-        f"`{PREFIX}kick @user [reason]` - Kicks a member from the server.\n"
-        f"`{PREFIX}ban @user [reason]` - Bans a member from the server.\n"
-        f"`{PREFIX}delwarn @user <number>` - Removes one of their warnings (number from `{PREFIX}warns`).\n"
-        f"`{PREFIX}clearwarns @user` - Clears all of a member's warnings.\n"
-        "\n"
-        "**🤖 Chat:**\n"
-        "`@mention` - Mention me with a question and i'll answer.\n"
-    )
+def _help_embed(bot_user, description):
     embed = discord.Embed(description=description, color=COLOR_AFK)
     if bot_user is not None:
-        embed.set_author(
-            name=bot_user.name,
-            icon_url=bot_user.display_avatar.url,
-        )
+        embed.set_author(name=bot_user.name, icon_url=bot_user.display_avatar.url)
     embed.set_footer(text="discord.gg/noxity")
     return embed
+
+
+def build_help_main_embed(bot_user):
+    """Front page of ;help."""
+    return _help_embed(bot_user, "Click any button to view.")
+
+
+def build_help_commands_embed(bot_user):
+    """The COMMANDS page of ;help."""
+    description = (
+        "__**Commands:**__\n"
+        f"**{PREFIX}help** - Shows this help message.\n"
+        f"**{PREFIX}afk <reason>** - Marks you as away. The bot tells anyone who pings you.\n"
+        f"**{PREFIX}summarize** - Summarizes the last 50 messages in the channel.\n"
+        f"**{PREFIX}reset** - Clears my memory in this channel.\n"
+        f"**{PREFIX}warns [@user]** - Shows your warnings. Mods can check anyone.\n"
+        "\n"
+        "__**Chat:**__\n"
+        "**@mention** - Mention me with a question and i'll answer.\n"
+    )
+    return _help_embed(bot_user, description)
+
+
+def build_help_moderation_embed(bot_user):
+    """The MODERATIONS page of ;help."""
+    description = (
+        "__**Moderation:**__\n"
+        f"**{PREFIX}warn @user <reason>** - Warns for Promoting / Other servers / Others.\n"
+        f"**{PREFIX}warn @user nsfw <reason>** - Warns for NSFW.\n"
+        f"**{PREFIX}to @user <time> [reason]** - Times someone out (`10m`, `2h`, `3d`, `1w`).\n"
+        f"**{PREFIX}rto @user** - Removes a timeout.\n"
+        f"**{PREFIX}kick @user [reason]** - Kicks a member from the server.\n"
+        f"**{PREFIX}ban @user [reason]** - Bans a member from the server.\n"
+        f"**{PREFIX}unban <user id>** - Unbans someone using their user ID.\n"
+        f"**{PREFIX}role @user <role name>** - Gives a role, or removes it if they already have it.\n"
+        f"**{PREFIX}delwarn @user <number>** - Removes one of their warnings (number from `{PREFIX}warns`).\n"
+        f"**{PREFIX}clearwarns @user** - Clears all of a member's warnings.\n"
+    )
+    return _help_embed(bot_user, description)
+
+
+class HelpView(discord.ui.View):
+    """Two gray buttons that switch the help embed between sections."""
+
+    def __init__(self, bot_user):
+        super().__init__(timeout=300)
+        self.bot_user = bot_user
+
+    @discord.ui.button(label="COMMANDS", style=discord.ButtonStyle.secondary)
+    async def commands_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=build_help_commands_embed(self.bot_user), view=self
+        )
+
+    @discord.ui.button(label="MODERATIONS", style=discord.ButtonStyle.secondary)
+    async def moderation_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=build_help_moderation_embed(self.bot_user), view=self
+        )
 
 
 async def get_summary(channel):
@@ -865,6 +1026,14 @@ class Client(discord.Client):
             await prefix_ban(message)
             return
 
+        if command == f"{PREFIX}unban":
+            await prefix_unban(message)
+            return
+
+        if command == f"{PREFIX}role":
+            await prefix_role(message)
+            return
+
         if command == f"{PREFIX}warns":
             await prefix_warns(message)
             return
@@ -893,7 +1062,11 @@ class Client(discord.Client):
             return
 
         if command == f"{PREFIX}help":
-            await message.reply(embed=build_help_embed(self.user), allowed_mentions=no_pings)
+            await message.reply(
+                embed=build_help_main_embed(self.user),
+                view=HelpView(self.user),
+                allowed_mentions=no_pings,
+            )
             return
 
         # AI reply only when the bot is @mentioned
@@ -1096,6 +1269,60 @@ async def slash_ban(
     await slash_finish(interaction, error, embed)
 
 
+@clients.tree.command(name="unban", description="Unban a user by their ID (mods/admins only)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(user_id="The ID of the banned user")
+async def slash_unban(interaction: discord.Interaction, user_id: str):
+    parsed = parse_user_id(user_id)
+    if parsed is None:
+        await interaction.response.send_message("That isn't a valid user ID.", ephemeral=True)
+        return
+    if not is_mod(interaction.user):
+        await interaction.response.send_message("Only **mods** and **admins** can use that.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    error, embed = await do_unban(interaction.guild, interaction.user, parsed, interaction.channel_id)
+    await slash_finish(interaction, error, embed)
+
+
+@clients.tree.command(name="role", description="Give or remove a role from a member (mods/admins only)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(member="Who to give or remove the role from", role="The role name to toggle")
+async def slash_role(interaction: discord.Interaction, member: discord.Member, role: str):
+    problem = validate(interaction.guild, interaction.user, member)
+    if problem:
+        await interaction.response.send_message(problem, ephemeral=True)
+        return
+    found_role = find_role(interaction.guild, role)
+    if found_role is None:
+        await interaction.response.send_message(
+            f"I couldn't find a role matching `{role}`.", ephemeral=True
+        )
+        return
+    await interaction.response.defer()
+    error, embed = await do_role(interaction.guild, interaction.user, member, found_role, interaction.channel_id)
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+    await interaction.followup.send(
+        member.mention,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False),
+    )
+
+
+@slash_role.autocomplete("role")
+async def role_autocomplete(interaction: discord.Interaction, current: str):
+    cur = current.lower().lstrip("@")
+    return [
+        app_commands.Choice(name=r.name, value=r.name)
+        for r in interaction.guild.roles
+        if not r.is_default() and cur in r.name.lower()
+    ][:25]
+
+
 @clients.tree.command(name="warns", description="Show warnings (yours, or anyone's if you're a mod)")
 @app_commands.guild_only()
 @app_commands.describe(user="Whose warnings to show (leave empty for yours)")
@@ -1144,4 +1371,4 @@ async def slash_clearwarns(interaction: discord.Interaction, user: discord.User)
     await slash_finish(interaction, error, embed)
 
 
-clients.run("BOT_TOKEN_HERE")
+clients.run("BOT_TOKEN")
