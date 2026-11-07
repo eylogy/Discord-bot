@@ -147,6 +147,21 @@ UNIT_MINUTES = {
     "mo": 43200, "month": 43200, "months": 43200,  # a month counts as 30 days
 }
 DURATION_HELP = "Time examples: `10m` (minutes), `2h` (hours), `3d` (days), `1w` (weeks)"
+ORDINAL_WORDS = {
+    1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth",
+    6: "sixth", 7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth",
+}
+
+
+def ordinal_word(n):
+    """1 -> 'first', 2 -> 'second', 12 -> '12th'."""
+    if n in ORDINAL_WORDS:
+        return ORDINAL_WORDS[n]
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
 
 
 def is_mod(member):
@@ -282,15 +297,18 @@ async def try_dm(user, embed):
         pass  # their DMs are closed
 
 
-async def send_mod_log(guild, embed, current_channel_id):
-    """Posts the embed in your mod log channel (if you set one)."""
+async def send_mod_log(guild, content, current_channel_id):
+    """Posts to your mod log channel (if you set one). Accepts plain text or an embed."""
     if not MOD_LOG_CHANNEL_ID:
         return
     channel = guild.get_channel(MOD_LOG_CHANNEL_ID)
     if channel is None or channel.id == current_channel_id:
         return
     try:
-        await channel.send(embed=embed)
+        if isinstance(content, str):
+            await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
+        else:
+            await channel.send(embed=content)
     except discord.HTTPException:
         pass
 
@@ -303,10 +321,11 @@ async def do_warn(guild, author, target, category, reason, channel_id):
     warn_id = add_warning(guild.id, target.id, author.id, reason, category)
     rows = get_warnings(guild.id, target.id)
     offense = sum(1 for row in rows if row[4] == category)
+    total = len(rows)
     ladder = LADDERS[category]
     step = ladder_step(category, offense)
 
-    # DM for the member
+    # DM for the member (unchanged)
     dm = discord.Embed(title=f"You were warned in {guild.name}", color=COLOR_WARN)
     dm.add_field(name="Rule", value=CATEGORY_LABELS[category], inline=False)
     dm.add_field(name="Reason", value=reason, inline=False)
@@ -314,7 +333,7 @@ async def do_warn(guild, author, target, category, reason, channel_id):
     dm.add_field(name="Consequence", value=step_label(step))
 
     # Carry out the action for this offense
-    note = None
+    extra = ""
     if step == "ban":
         await try_dm(target, dm)  # before the ban, since they can't be messaged after
         if AUTO_BAN:
@@ -323,36 +342,26 @@ async def do_warn(guild, author, target, category, reason, channel_id):
                     reason=f"Offense {offense} ({CATEGORY_LABELS[category]}): {reason}",
                     delete_message_seconds=0,
                 )
-                note = "Reached the ban stage, so they were banned."
+                extra = " they hit the ban stage, so they got banned."
             except discord.HTTPException:
-                note = "Reached the ban stage, but i couldn't ban them (check my **Ban Members** permission and role position)."
+                extra = " they hit the ban stage, but i couldn't ban them (check my Ban Members permission)."
         else:
-            note = "Reached the ban stage. AUTO_BAN is off, so a mod needs to decide."
+            extra = " they hit the ban stage, but AUTO_BAN is off, so a mod needs to decide."
     elif step is not None:
         try:
             await target.timeout(
                 timedelta(minutes=step),
                 reason=f"Offense {offense} ({CATEGORY_LABELS[category]}): {reason}",
             )
-            note = f"Timed out for {format_duration(step)}."
         except discord.HTTPException:
-            note = "I couldn't time them out (check my **Moderate Members** permission and role position)."
+            extra = " i couldn't time them out (check my Moderate Members permission)."
         await try_dm(target, dm)
     else:
         await try_dm(target, dm)
 
-    embed = discord.Embed(title="⚠️ Member warned", color=COLOR_WARN)
-    embed.add_field(name="Member", value=target.mention)
-    embed.add_field(name="Warned by", value=author.mention)
-    embed.add_field(name="Offense", value=f"{min(offense, len(ladder))} of {len(ladder)}")
-    embed.add_field(name="Rule", value=CATEGORY_LABELS[category], inline=False)
-    embed.add_field(name="Reason", value=reason, inline=False)
-    embed.add_field(name="Action", value=step_label(step), inline=False)
-    if note:
-        embed.add_field(name="Result", value=note, inline=False)
-    embed.set_footer(text=f"Warning ID: {warn_id}")
-    await send_mod_log(guild, embed, channel_id)
-    return None, embed
+    text = f"**{target.display_name}** has been warned, this is their {ordinal_word(total)} warning.{extra}"
+    await send_mod_log(guild, text, channel_id)
+    return None, text
 
 
 async def do_timeout(guild, author, target, minutes, reason, channel_id):
@@ -361,7 +370,8 @@ async def do_timeout(guild, author, target, minutes, reason, channel_id):
         return problem, None
     if minutes > MAX_TIMEOUT_MINUTES:
         return (
-            "Timeouts up to **28 days** only. "
+            "Discord only allows timeouts up to **28 days** (`4w`), so months aren't possible "
+            "for a timeout. Use `4w` or less, or ban the member for something longer."
         ), None
 
     try:
@@ -375,20 +385,14 @@ async def do_timeout(guild, author, target, minutes, reason, channel_id):
             "and that my role is above theirs."
         ), None
 
-    until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
     dm = discord.Embed(title=f"You were timed out in {guild.name}", color=COLOR_WARN)
     dm.add_field(name="Duration", value=format_duration(minutes))
     dm.add_field(name="Reason", value=reason, inline=False)
     await try_dm(target, dm)
 
-    embed = discord.Embed(title="⏳ Member timed out", color=COLOR_WARN)
-    embed.add_field(name="Member", value=target.mention)
-    embed.add_field(name="By", value=author.mention)
-    embed.add_field(name="Duration", value=format_duration(minutes))
-    embed.add_field(name="Ends", value=discord.utils.format_dt(until, "R"))
-    embed.add_field(name="Reason", value=reason, inline=False)
-    await send_mod_log(guild, embed, channel_id)
-    return None, embed
+    text = f"**{target.display_name}** has been timed out for **{format_duration(minutes)}**."
+    await send_mod_log(guild, text, channel_id)
+    return None, text
 
 
 async def do_untimeout(guild, author, target, channel_id):
@@ -401,13 +405,9 @@ async def do_untimeout(guild, author, target, channel_id):
     except discord.HTTPException:
         return "I couldn't remove their timeout. Check my **Moderate Members** permission and role position.", None
 
-    embed = discord.Embed(
-        description=f"Removed the timeout from {target.mention}.",
-        color=COLOR_AFK,
-    )
-    embed.set_footer(text=f"Removed by {author.display_name}")
-    await send_mod_log(guild, embed, channel_id)
-    return None, embed
+    text = f"**{target.display_name}** has had their timeout removed."
+    await send_mod_log(guild, text, channel_id)
+    return None, text
 
 
 async def do_kick(guild, author, target, reason, channel_id):
@@ -454,12 +454,9 @@ async def do_ban(guild, author, target, reason, channel_id):
             "and that my role is above theirs."
         ), None
 
-    embed = discord.Embed(title="🔨 Member banned", color=COLOR_WARN)
-    embed.add_field(name="Member", value=f"{target.mention} ({target})")
-    embed.add_field(name="By", value=author.mention)
-    embed.add_field(name="Reason", value=reason, inline=False)
-    await send_mod_log(guild, embed, channel_id)
-    return None, embed
+    text = f"**{target.display_name}** got banned LOOOL"
+    await send_mod_log(guild, text, channel_id)
+    return None, text
 
 
 async def do_unban(guild, author, user_id, channel_id):
@@ -480,17 +477,13 @@ async def do_unban(guild, author, user_id, channel_id):
     except discord.HTTPException:
         return "I couldn't unban them. Check that i have the **Ban Members** permission.", None
 
-    embed = discord.Embed(title="✅ Member unbanned", color=COLOR_AFK)
-    embed.add_field(name="User", value=f"{user} (`{user.id}`)")
-    embed.add_field(name="By", value=author.mention)
-    if ban_entry.reason:
-        embed.add_field(name="Original ban reason", value=ban_entry.reason[:300], inline=False)
-    await send_mod_log(guild, embed, channel_id)
-    return None, embed
+    text = f"**{user.display_name}** has been unbanned."
+    await send_mod_log(guild, text, channel_id)
+    return None, text
 
 
 async def do_role(guild, author, target, role, channel_id):
-    """Gives the role if they don't have it, removes it if they do. Returns (error, embed)."""
+    """Gives the role if they don't have it, removes it if they do. Returns (error, text)."""
     problem = validate(guild, author, target)
     if problem:
         return problem, None
@@ -505,27 +498,15 @@ async def do_role(guild, author, target, role, channel_id):
     try:
         if role in target.roles:
             await target.remove_roles(role, reason=reason)
-            embed = discord.Embed(
-                title="🏷️ Role removed",
-                description=f"Removed **{role.name}** from {target.mention}.",
-                color=COLOR_AFK,
-            )
+            text = f"**{role.name}** removed from **{target.mention}** by **{author.display_name}**"
         else:
             await target.add_roles(role, reason=reason)
-            embed = discord.Embed(
-                title="🏷️ Role given",
-                description=f"Gave **{role.name}** to {target.mention}.",
-                color=COLOR_AFK,
-            )
+            text = f"**{role.name}** given to **{target.mention}** by **{author.display_name}**"
     except discord.HTTPException:
         return "I couldn't change their roles. Check my **Manage Roles** permission and role position.", None
 
-    embed.add_field(name="Member", value=f"{target.mention} ({target})")
-    embed.add_field(name="Role", value=role.mention)
-    embed.add_field(name="By", value=author.mention)
-    embed.set_footer(text=f"Changed by {author.display_name}")
-    await send_mod_log(guild, embed, channel_id)
-    return None, embed
+    await send_mod_log(guild, text, channel_id)
+    return None, text
 
 
 async def do_warnings(guild, author, user_id):
@@ -582,7 +563,7 @@ async def do_delwarn(guild, author, target, number, channel_id):
     remaining = len(rows) - 1
     embed = discord.Embed(
         description=(
-            f"Removed warning **#{number}** from {target.mention}. "
+            f"**Removed warning **#{number}** from **{target.mention}**. "
             f"They now have **{remaining}** warning{'' if remaining == 1 else 's'}."
         ),
         color=COLOR_AFK,
@@ -610,11 +591,15 @@ async def do_clearwarns(guild, author, user_id, channel_id):
 # ---------------------------------------------------------------------------
 # ;prefix command handlers (they read the message, then call the logic above)
 # ---------------------------------------------------------------------------
-async def reply_result(message, error, embed):
+async def reply_result(message, error, result):
+    """Replies with the error, the plain text result, or the embed result."""
+    no_mentions = discord.AllowedMentions.none()
     if error:
-        await message.reply(error)
+        await message.reply(error, allowed_mentions=no_mentions)
+    elif isinstance(result, str):
+        await message.reply(result, allowed_mentions=no_mentions)
     else:
-        await message.reply(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        await message.reply(embed=result, allowed_mentions=no_mentions)
 
 
 async def prefix_warn(message):
@@ -644,8 +629,8 @@ async def prefix_warn(message):
         rest = remainder.strip()
     reason = rest[:300] or "No reason given"
 
-    error, embed = await do_warn(guild, message.author, target, category, reason, message.channel.id)
-    await reply_result(message, error, embed)
+    error, result = await do_warn(guild, message.author, target, category, reason, message.channel.id)
+    await reply_result(message, error, result)
 
 
 async def prefix_to(message):
@@ -664,8 +649,8 @@ async def prefix_to(message):
         return
 
     reason = args[3].strip()[:300] if len(args) > 3 else "No reason given"
-    error, embed = await do_timeout(guild, message.author, target, minutes, reason, message.channel.id)
-    await reply_result(message, error, embed)
+    error, result = await do_timeout(guild, message.author, target, minutes, reason, message.channel.id)
+    await reply_result(message, error, result)
 
 
 async def prefix_rto(message):
@@ -682,8 +667,8 @@ async def prefix_rto(message):
         await message.reply(f"Usage: `{PREFIX}rto @user`")
         return
 
-    error, embed = await do_untimeout(guild, message.author, target, message.channel.id)
-    await reply_result(message, error, embed)
+    error, result = await do_untimeout(guild, message.author, target, message.channel.id)
+    await reply_result(message, error, result)
 
 
 async def prefix_kick(message):
@@ -701,8 +686,8 @@ async def prefix_kick(message):
         return
 
     reason = args[2].strip()[:300] if len(args) > 2 else "No reason given"
-    error, embed = await do_kick(guild, message.author, target, reason, message.channel.id)
-    await reply_result(message, error, embed)
+    error, result = await do_kick(guild, message.author, target, reason, message.channel.id)
+    await reply_result(message, error, result)
 
 
 async def prefix_ban(message):
@@ -720,8 +705,8 @@ async def prefix_ban(message):
         return
 
     reason = args[2].strip()[:300] if len(args) > 2 else "No reason given"
-    error, embed = await do_ban(guild, message.author, target, reason, message.channel.id)
-    await reply_result(message, error, embed)
+    error, result = await do_ban(guild, message.author, target, reason, message.channel.id)
+    await reply_result(message, error, result)
 
 
 async def prefix_unban(message):
@@ -734,11 +719,11 @@ async def prefix_unban(message):
     args = message.content.strip().split()
     user_id = parse_user_id(args[1]) if len(args) > 1 else None
     if user_id is None:
-        await message.reply(f"Usage: `{PREFIX}unban <user id>`")
+        await message.reply(f"Usage: `{PREFIX}unban <user id>` (right-click the user's ID to copy it)")
         return
 
-    error, embed = await do_unban(message.guild, message.author, user_id, message.channel.id)
-    await reply_result(message, error, embed)
+    error, result = await do_unban(message.guild, message.author, user_id, message.channel.id)
+    await reply_result(message, error, result)
 
 
 async def prefix_role(message):
@@ -753,17 +738,16 @@ async def prefix_role(message):
     role = find_role(message.guild, args[2]) if len(args) > 2 else None
     if target is None or role is None:
         await message.reply(
-            f"Usage: `{PREFIX}role @user <rolename>`)"
+            f"Usage: `{PREFIX}role @user <role name>` (a mention, ID, or name works)"
         )
         return
 
-    error, embed = await do_role(message.guild, message.author, target, role, message.channel.id)
+    error, text = await do_role(message.guild, message.author, target, role, message.channel.id)
     if error:
         await message.reply(error)
         return
     await message.reply(
-        target.mention,
-        embed=embed,
+        text,
         allowed_mentions=discord.AllowedMentions(users=[target], roles=False, everyone=False, replied_user=False),
     )
 
@@ -780,8 +764,8 @@ async def prefix_warns(message):
     else:
         user_id = message.author.id
 
-    error, embed = await do_warnings(message.guild, message.author, user_id)
-    await reply_result(message, error, embed)
+    error, result = await do_warnings(message.guild, message.author, user_id)
+    await reply_result(message, error, result)
 
 
 async def prefix_delwarn(message):
@@ -797,11 +781,12 @@ async def prefix_delwarn(message):
     if target is None or number is None:
         await message.reply(
             f"Usage: `{PREFIX}delwarn @user <number>`\n"
+            f"The number is the warning's position in `{PREFIX}warns @user`."
         )
         return
 
-    error, embed = await do_delwarn(message.guild, message.author, target, number, message.channel.id)
-    await reply_result(message, error, embed)
+    error, result = await do_delwarn(message.guild, message.author, target, number, message.channel.id)
+    await reply_result(message, error, result)
 
 
 async def prefix_clearwarns(message):
@@ -817,8 +802,8 @@ async def prefix_clearwarns(message):
         await message.reply(f"Usage: `{PREFIX}clearwarns @user`")
         return
 
-    error, embed = await do_clearwarns(message.guild, message.author, int(found.group()), message.channel.id)
-    await reply_result(message, error, embed)
+    error, result = await do_clearwarns(message.guild, message.author, int(found.group()), message.channel.id)
+    await reply_result(message, error, result)
 
 
 # ---------------------------------------------------------------------------
@@ -1048,9 +1033,6 @@ class Client(discord.Client):
 
         # Prefix commands like ;reset and ;summarize
         if command == f"{PREFIX}reset":
-            if not is_mod(message.author):
-                await message.reply("Only **mods** and **admins** can reset my memory.")
-                return
             chats.pop(message.channel.id, None)
             await message.reply("Memory cleared! Starting over...")
             return
@@ -1123,23 +1105,20 @@ RULE_CHOICES = [
 ]
 
 
-async def slash_finish(interaction, error, embed):
+async def slash_finish(interaction, error, result):
     """Sends the result of a slash command that already used defer()."""
+    no_mentions = discord.AllowedMentions.none()
     if error:
-        await interaction.followup.send(error)
+        await interaction.followup.send(error, allowed_mentions=no_mentions)
+    elif isinstance(result, str):
+        await interaction.followup.send(result, allowed_mentions=no_mentions)
     else:
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=result)
 
 
-@clients.tree.command(name="reset", description="Clear the AI's memory for this channel (mods/admins only)")
+@clients.tree.command(name="reset", description="Clear the AI's memory for this channel")
 @app_commands.guild_only()
-@app_commands.default_permissions(manage_messages=True)
 async def reset(interaction: discord.Interaction):
-    if not is_mod(interaction.user):
-        await interaction.response.send_message(
-            "Only mods and admins can reset my memory.", ephemeral=True
-        )
-        return
     chats.pop(interaction.channel_id, None)
     await interaction.response.send_message("Memory cleared! Starting over...")
 
@@ -1172,10 +1151,10 @@ async def slash_warn(
         return
     await interaction.response.defer()
     category = rule.value if rule else "general"
-    error, embed = await do_warn(
+    error, result = await do_warn(
         interaction.guild, interaction.user, member, category, reason[:300], interaction.channel_id
     )
-    await slash_finish(interaction, error, embed)
+    await slash_finish(interaction, error, result)
 
 
 @clients.tree.command(name="to", description="Time a member out (mods/admins only)")
@@ -1201,10 +1180,10 @@ async def slash_to(
         await interaction.response.send_message(DURATION_HELP, ephemeral=True)
         return
     await interaction.response.defer()
-    error, embed = await do_timeout(
+    error, result = await do_timeout(
         interaction.guild, interaction.user, member, minutes, reason[:300], interaction.channel_id
     )
-    await slash_finish(interaction, error, embed)
+    await slash_finish(interaction, error, result)
 
 
 @clients.tree.command(name="rto", description="Remove a member's timeout (mods/admins only)")
@@ -1217,10 +1196,10 @@ async def slash_rto(interaction: discord.Interaction, member: discord.Member):
         await interaction.response.send_message(problem, ephemeral=True)
         return
     await interaction.response.defer()
-    error, embed = await do_untimeout(
+    error, result = await do_untimeout(
         interaction.guild, interaction.user, member, interaction.channel_id
     )
-    await slash_finish(interaction, error, embed)
+    await slash_finish(interaction, error, result)
 
 
 @clients.tree.command(name="kick", description="Kick a member from the server (mods/admins only)")
@@ -1240,10 +1219,10 @@ async def slash_kick(
         await interaction.response.send_message(problem, ephemeral=True)
         return
     await interaction.response.defer()
-    error, embed = await do_kick(
+    error, result = await do_kick(
         interaction.guild, interaction.user, member, reason[:300], interaction.channel_id
     )
-    await slash_finish(interaction, error, embed)
+    await slash_finish(interaction, error, result)
 
 
 @clients.tree.command(name="ban", description="Ban a member from the server (mods/admins only)")
@@ -1263,10 +1242,10 @@ async def slash_ban(
         await interaction.response.send_message(problem, ephemeral=True)
         return
     await interaction.response.defer()
-    error, embed = await do_ban(
+    error, result = await do_ban(
         interaction.guild, interaction.user, member, reason[:300], interaction.channel_id
     )
-    await slash_finish(interaction, error, embed)
+    await slash_finish(interaction, error, result)
 
 
 @clients.tree.command(name="unban", description="Unban a user by their ID (mods/admins only)")
@@ -1282,8 +1261,8 @@ async def slash_unban(interaction: discord.Interaction, user_id: str):
         await interaction.response.send_message("Only **mods** and **admins** can use that.", ephemeral=True)
         return
     await interaction.response.defer()
-    error, embed = await do_unban(interaction.guild, interaction.user, parsed, interaction.channel_id)
-    await slash_finish(interaction, error, embed)
+    error, result = await do_unban(interaction.guild, interaction.user, parsed, interaction.channel_id)
+    await slash_finish(interaction, error, result)
 
 
 @clients.tree.command(name="role", description="Give or remove a role from a member (mods/admins only)")
@@ -1302,13 +1281,12 @@ async def slash_role(interaction: discord.Interaction, member: discord.Member, r
         )
         return
     await interaction.response.defer()
-    error, embed = await do_role(interaction.guild, interaction.user, member, found_role, interaction.channel_id)
+    error, text = await do_role(interaction.guild, interaction.user, member, found_role, interaction.channel_id)
     if error:
         await interaction.followup.send(error, ephemeral=True)
         return
     await interaction.followup.send(
-        member.mention,
-        embed=embed,
+        text,
         allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False),
     )
 
@@ -1371,4 +1349,4 @@ async def slash_clearwarns(interaction: discord.Interaction, user: discord.User)
     await slash_finish(interaction, error, embed)
 
 
-clients.run("BOT_TOKEN")
+clients.run("BOT_TOKEN_HERE")
