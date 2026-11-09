@@ -9,23 +9,21 @@ from google.genai import types
 
 PREFIX = "?"
 
-# Bot status: shows as "Listening to ..." and rotates through this list.
-# {servers} is replaced by the server count if you ever want to use it.
 STATUSES = [
     ".gg/noxity",
-    "NOXITY ON TOP",
+    "house of owls",
+    "lurking @ noxity",
     "?help",
 ]
-STATUS_INTERVAL = 60  # seconds between changes (60 = 1 minute)
+STATUS_INTERVAL = 60
 
 # ---------------------------------------------------------------------------
 # Warning system settings
 # ---------------------------------------------------------------------------
-MOD_LOG_CHANNEL_ID = 0  # paste a channel ID here to log every warning/timeout there
+MOD_LOG_CHANNEL_ID = 0
 DB_FILE = "warnings.db"
-AUTO_BAN = True  # False = the bot won't ban on the 5th offense, it just tells to review
+AUTO_BAN = True
 
-# What each offense does, per category. Numbers are minutes of timeout.
 #   None  = reminder only (no action)
 #   "ban" = ban
 CATEGORY_LABELS = {
@@ -33,11 +31,23 @@ CATEGORY_LABELS = {
     "nsfw": "NSFW",
 }
 LADDERS = {
-    "general": [None, 60, 120, 240, "ban"],         # reminder, 1h, 2h, 4h, ban
-    "nsfw": [None, 600, 1440, 10080, "ban"],        # reminder, 10h, 1d, 1 week, ban
+    "general": [None, 60, 120, 240, "ban"],
+    "nsfw": [None, 600, 1440, 10080, "ban"],
 }
 
-MAX_TIMEOUT_MINUTES = 28 * 24 * 60  # Discord's limit: 28 days
+MAX_TIMEOUT_MINUTES = 28 * 24 * 60
+
+# Roles with any of these permissions can't be removed with the role command
+PROTECTED_PERMS = (
+    "administrator",
+    "manage_guild",
+    "manage_roles",
+    "ban_members",
+    "kick_members",
+    "moderate_members",
+    "manage_channels",
+    "manage_webhooks",
+)
 
 SYSTEM_PROMPT = (
     "You are a chill Gen Z AI in a Discord server. Talk casually in lowercase with slang like "
@@ -52,14 +62,14 @@ SYSTEM_PROMPT = (
 MODEL = "gemini-3.5-flash-lite"
 
 ai = genai.Client(api_key="GEMINI_API_KEY")
-chats = {}  # channel id -> chat session (remembers history)
-afk = {}    # user id -> (reason, time they went afk)
+chats = {}
+afk = {}
 
 # Embed colors (all black)
-COLOR_AFK = discord.Color(0x010101)   # black
-COLOR_WARN = discord.Color(0x010101)  # black
+COLOR_AFK = discord.Color(0x010101)
+COLOR_WARN = discord.Color(0x010101)
 
-# Words to watch for -> emoji to react with
+# Auto reacts
 REACTIONS = {
     "eyl": "🫃",
     "kori": "🫃",
@@ -72,8 +82,6 @@ REACTIONS = {
     "eli": "🫃",
     "rune": "🫃",
     "ria": "🫃",
-    "jah": "🫃",
-    "ryry": "🫃",
     "hori": "🫃",
     "kino": "🫃",
 }
@@ -170,6 +178,17 @@ def is_mod(member):
     return bool(perms and (perms.administrator or perms.manage_messages))
 
 
+def can_manage_roles(member):
+    """True if the member is an admin or has Manage Roles. False in DMs."""
+    perms = getattr(member, "guild_permissions", None)
+    return bool(perms and (perms.administrator or perms.manage_roles))
+
+
+def is_protected_role(role):
+    """True if the role has any permission in PROTECTED_PERMS."""
+    return any(getattr(role.permissions, perm, False) for perm in PROTECTED_PERMS)
+
+
 def time_ago(since):
     """Turns a time into text like '8 seconds ago' or '5 minutes ago'."""
     seconds = int((datetime.now(timezone.utc) - since).total_seconds())
@@ -231,6 +250,17 @@ def validate(guild, author, target=None):
             return "You can't do that to that person."
         if author.id != guild.owner_id and target.top_role >= author.top_role:
             return "That member's top role is the same as or higher than yours."
+    return None
+
+
+def validate_role(guild, author, target):
+    """Checks for the role command. Self and higher-ranked members are allowed."""
+    if guild is None:
+        return "That only works inside a server."
+    if not can_manage_roles(author):
+        return "Only members with **Manage Roles** can use that."
+    if target.bot:
+        return "You can't change roles on a bot."
     return None
 
 
@@ -325,7 +355,7 @@ async def do_warn(guild, author, target, category, reason, channel_id):
     ladder = LADDERS[category]
     step = ladder_step(category, offense)
 
-    # DM for the member (unchanged)
+    # DM for the member
     dm = discord.Embed(title=f"You were warned in {guild.name}", color=COLOR_WARN)
     dm.add_field(name="Rule", value=CATEGORY_LABELS[category], inline=False)
     dm.add_field(name="Reason", value=reason, inline=False)
@@ -484,19 +514,21 @@ async def do_unban(guild, author, user_id, channel_id):
 
 async def do_role(guild, author, target, role, channel_id):
     """Gives the role if they don't have it, removes it if they do. Returns (error, text)."""
-    problem = validate(guild, author, target)
+    problem = validate_role(guild, author, target)
     if problem:
         return problem, None
     if role.is_default() or role.managed:
         return "I can't give or remove that role.", None
-    if author.id != guild.owner_id and role >= author.top_role:
-        return "That role is the same as or higher than your top role.", None
     if role >= guild.me.top_role:
-        return "That role is the same as or higher than my top role, so i can't manage it.", None
+        return "That role is at or above my top role, so i can't manage it.", None
+
+    has_role = role in target.roles
+    if has_role and is_protected_role(role):
+        return "That role has admin-level permissions, so it can't be removed with this command.", None
 
     reason = f"Role toggled by {author}"
     try:
-        if role in target.roles:
+        if has_role:
             await target.remove_roles(role, reason=reason)
             text = f"**{role.name}** removed from **{target.mention}** by **{author.display_name}**"
         else:
@@ -563,7 +595,7 @@ async def do_delwarn(guild, author, target, number, channel_id):
     remaining = len(rows) - 1
     embed = discord.Embed(
         description=(
-            f"**Removed warning **#{number}** from **{target.mention}**. "
+            f"Removed warning **#{number}** from {target.mention}. "
             f"They now have **{remaining}** warning{'' if remaining == 1 else 's'}."
         ),
         color=COLOR_AFK,
@@ -728,7 +760,7 @@ async def prefix_unban(message):
 
 async def prefix_role(message):
     """;role @user <role name, mention, or ID>"""
-    problem = validate(message.guild, message.author)
+    problem = validate_role(message.guild, message.author, message.author)
     if problem:
         await message.reply(problem)
         return
@@ -849,7 +881,7 @@ def build_help_moderation_embed(bot_user):
         f"**{PREFIX}kick @user [reason]** - Kicks a member from the server.\n"
         f"**{PREFIX}ban @user [reason]** - Bans a member from the server.\n"
         f"**{PREFIX}unban <user id>** - Unbans someone using their user ID.\n"
-        f"**{PREFIX}role @user <role name>** - Gives a role, or removes it if they already have it.\n"
+        f"**{PREFIX}role @user <role name>** - Gives a role, or removes it if they already have it. Needs Manage Roles.\n"
         f"**{PREFIX}delwarn @user <number>** - Removes one of their warnings (number from `{PREFIX}warns`).\n"
         f"**{PREFIX}clearwarns @user** - Clears all of a member's warnings.\n"
     )
@@ -918,8 +950,8 @@ class Client(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        await self.tree.sync()  # registers the slash commands with Discord
-        asyncio.create_task(self.rotate_status())  # starts the status
+        await self.tree.sync()
+        asyncio.create_task(self.rotate_status())
 
     async def rotate_status(self):
         """Sets 'Listening to ...' and rotates it if there is more than one status."""
@@ -932,7 +964,7 @@ class Client(discord.Client):
                 activity=discord.Activity(type=discord.ActivityType.listening, name=name),
             )
             if len(STATUSES) == 1:
-                return  # only one status, so no need to keep changing it
+                return
             i += 1
             await asyncio.sleep(STATUS_INTERVAL)
 
@@ -954,7 +986,7 @@ class Client(discord.Client):
 
         parts = content.strip().split()
         command = parts[0] if parts else ""
-        no_pings = discord.AllowedMentions.none()  # replies never ping anyone
+        no_pings = discord.AllowedMentions.none()
 
         # ;afk <reason> - mark yourself as away
         if command == f"{PREFIX}afk":
@@ -969,8 +1001,6 @@ class Client(discord.Client):
             await message.reply(embed=embed, allowed_mentions=no_pings)
             return
 
-        # If an afk person sends any other message, they're back.
-        # The welcome back message deletes itself after 2 seconds.
         if message.author.id in afk:
             _, since = afk.pop(message.author.id)
             await message.reply(
@@ -979,7 +1009,6 @@ class Client(discord.Client):
                 delete_after=2,
             )
 
-        # If someone pinged an afk person, tell them
         notes = []
         for user in message.mentions:
             if user.bot or user.id == message.author.id or user.id not in afk:
@@ -1031,7 +1060,7 @@ class Client(discord.Client):
             await prefix_clearwarns(message)
             return
 
-        # Prefix commands like ;reset and ;summarize
+        # Prefix commands like ?reset and ?summarize
         if command == f"{PREFIX}reset":
             chats.pop(message.channel.id, None)
             await message.reply("Memory cleared! Starting over...")
@@ -1084,14 +1113,13 @@ class Client(discord.Client):
                 await message.reply("Sorry, something went wrong (maybe a rate limit). Try again in a minute.")
                 return
 
-        # Discord's limit is 2000 characters per message
         for i in range(0, len(reply), 2000):
             await message.reply(reply[i:i + 2000])
 
 
 intents = discord.Intents.default()
 intents.messages = True
-intents.message_content = True  # needed so the bot can read message text
+intents.message_content = True
 
 clients = Client(intents=intents)
 
@@ -1125,7 +1153,7 @@ async def reset(interaction: discord.Interaction):
 
 @clients.tree.command(name="summarize", description="Summarize the last 50 messages in this channel")
 async def summarize(interaction: discord.Interaction):
-    await interaction.response.defer()  # Gemini takes a few seconds
+    await interaction.response.defer()
     summary = await get_summary(interaction.channel)
     await interaction.followup.send(summary)
 
@@ -1265,12 +1293,12 @@ async def slash_unban(interaction: discord.Interaction, user_id: str):
     await slash_finish(interaction, error, result)
 
 
-@clients.tree.command(name="role", description="Give or remove a role from a member (mods/admins only)")
+@clients.tree.command(name="role", description="Give or remove a role from a member (Manage Roles only)")
 @app_commands.guild_only()
-@app_commands.default_permissions(manage_messages=True)
+@app_commands.default_permissions(manage_roles=True)
 @app_commands.describe(member="Who to give or remove the role from", role="The role name to toggle")
 async def slash_role(interaction: discord.Interaction, member: discord.Member, role: str):
-    problem = validate(interaction.guild, interaction.user, member)
+    problem = validate_role(interaction.guild, interaction.user, member)
     if problem:
         await interaction.response.send_message(problem, ephemeral=True)
         return
@@ -1349,4 +1377,4 @@ async def slash_clearwarns(interaction: discord.Interaction, user: discord.User)
     await slash_finish(interaction, error, embed)
 
 
-clients.run("BOT_TOKEN_HERE")
+clients.run("BOT_TOKEN")
