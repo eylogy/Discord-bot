@@ -264,6 +264,19 @@ def validate_role(guild, author, target):
     return None
 
 
+def role_above_problem(guild, author, role):
+    """Carl-bot style check: you can only hand out roles lower than your highest role."""
+    if author.id == guild.owner_id:
+        return None
+    if role >= author.top_role:
+        return (
+            f"The role '{role.name}' (pos {role.position}) is above your highest role "
+            f"'{author.top_role.name}' (pos {author.top_role.position}) and cannot be handed "
+            f"out by you normally. Ask a higher-up mod to be dragged up."
+        )
+    return None
+
+
 async def find_member(guild, text):
     """Finds a server member from a mention (<@123>) or a plain user ID."""
     found = USER_ID_RE.search(text)
@@ -519,6 +532,11 @@ async def do_role(guild, author, target, role, channel_id):
         return problem, None
     if role.is_default() or role.managed:
         return "I can't give or remove that role.", None
+
+    problem = role_above_problem(guild, author, role)
+    if problem:
+        return problem, None
+
     if role >= guild.me.top_role:
         return "That role is at or above my top role, so i can't manage it.", None
 
