@@ -1,11 +1,15 @@
 import asyncio
+import os
 import re
 import sqlite3
 import discord
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from discord import app_commands
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+
+load_dotenv()
 
 PREFIX = "?"
 
@@ -55,19 +59,21 @@ SYSTEM_PROMPT = (
     "Give correct answers to real questions and explain things simply. "
     "Keep replies short, 1 to 3 sentences, and use an emoji now and then. "
     "If you don't know the answer, say 'idk' or 'not sure' instead of making something up. "
-    "If someone asks you who the owner of the server is, say 'eylogy is the owner of this server' and nothing else. "
-    "Don't use unnecessary emojis, and don't use emojis in every sentence. Don't use emojis in the middle of words."
+    "If someone asks you who created you, say 'eylogy created me'. "
+    "Don't use unnecessary emojis, and don't use emojis in every sentence. Don't use emojis in the middle of words. "
+    "If someone asks what your name, say 'my names diddy' and nothing else. "
+    "If someone tried comparing you to other discord bots, say you are the goated one."
 )
 
 MODEL = "gemini-3.5-flash-lite"
 
-ai = genai.Client(api_key="GEMINI_API_KEY")
+ai = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 chats = {}
 afk = {}
 
-# Embed colors (all black)
-COLOR_AFK = discord.Color(0x010101)
-COLOR_WARN = discord.Color(0x010101)
+# Embed colors (all #242429)
+COLOR_AFK = discord.Color(0x242429)
+COLOR_WARN = discord.Color(0x242429)
 
 # Auto reacts
 REACTIONS = {
@@ -87,7 +93,7 @@ REACTIONS = {
 }
 
 # ---------------------------------------------------------------------------
-# Warning database
+# Database
 # ---------------------------------------------------------------------------
 db = sqlite3.connect(DB_FILE)
 db.execute(
@@ -105,6 +111,30 @@ db.execute(
 _columns = [row[1] for row in db.execute("PRAGMA table_info(warnings)")]
 if "category" not in _columns:
     db.execute("ALTER TABLE warnings ADD COLUMN category TEXT NOT NULL DEFAULT 'general'")
+db.commit()
+
+# streak_sends: one row per "?streak" a member sends to another member, per UTC day
+db.execute(
+    """CREATE TABLE IF NOT EXISTS streak_sends (
+        guild_id INTEGER NOT NULL,
+        sender_id INTEGER NOT NULL,
+        receiver_id INTEGER NOT NULL,
+        day TEXT NOT NULL,
+        PRIMARY KEY (guild_id, sender_id, receiver_id, day)
+    )"""
+)
+# streak_pairs: one row per pair of members (stored as low/high id so order doesn't matter)
+db.execute(
+    """CREATE TABLE IF NOT EXISTS streak_pairs (
+        guild_id INTEGER NOT NULL,
+        user_low INTEGER NOT NULL,
+        user_high INTEGER NOT NULL,
+        streak INTEGER NOT NULL DEFAULT 0,
+        last_day TEXT,
+        grace_week TEXT,
+        PRIMARY KEY (guild_id, user_low, user_high)
+    )"""
+)
 db.commit()
 
 
@@ -356,6 +386,257 @@ async def send_mod_log(guild, content, current_channel_id):
         pass
 
 
+# ---------------------------------------------------------------------------
+# Streak logic
+# ---------------------------------------------------------------------------
+def pair_key(a, b):
+    """Stores each pair in the same order no matter who sent first."""
+    return (min(a, b), max(a, b))
+
+
+def iso_week(day):
+    year, week, _ = day.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def has_sent(guild_id, sender_id, receiver_id, day):
+    row = db.execute(
+        "SELECT 1 FROM streak_sends WHERE guild_id = ? AND sender_id = ? AND receiver_id = ? AND day = ?",
+        (guild_id, sender_id, receiver_id, day.isoformat()),
+    ).fetchone()
+    return row is not None
+
+
+def record_send(guild_id, sender_id, receiver_id, day):
+    db.execute(
+        "INSERT OR IGNORE INTO streak_sends (guild_id, sender_id, receiver_id, day) VALUES (?, ?, ?, ?)",
+        (guild_id, sender_id, receiver_id, day.isoformat()),
+    )
+    db.commit()
+
+
+def get_pair(guild_id, a, b):
+    low, high = pair_key(a, b)
+    row = db.execute(
+        "SELECT streak, last_day, grace_week FROM streak_pairs "
+        "WHERE guild_id = ? AND user_low = ? AND user_high = ?",
+        (guild_id, low, high),
+    ).fetchone()
+    return row if row else (0, None, None)
+
+
+def save_pair(guild_id, a, b, streak, last_day, grace_week):
+    low, high = pair_key(a, b)
+    db.execute(
+        "INSERT INTO streak_pairs (guild_id, user_low, user_high, streak, last_day, grace_week) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(guild_id, user_low, user_high) DO UPDATE SET "
+        "streak = excluded.streak, last_day = excluded.last_day, grace_week = excluded.grace_week",
+        (guild_id, low, high, streak, last_day, grace_week),
+    )
+    db.commit()
+
+
+def complete_streak(guild_id, a, b, today):
+    """Runs when both sides have sent today. Returns (new_streak, used_grace_day)."""
+    streak, last_day_str, grace_week = get_pair(guild_id, a, b)
+    last_day = date.fromisoformat(last_day_str) if last_day_str else None
+    this_week = iso_week(today)
+    used_grace = False
+
+    if last_day == today:
+        return streak, False  # already counted today
+
+    if last_day is None:
+        streak = 1
+    elif last_day == today - timedelta(days=1):
+        streak += 1
+    elif last_day == today - timedelta(days=2) and grace_week != this_week:
+        # exactly one missed day, and this pair hasn't used its grace day this week
+        streak += 1
+        grace_week = this_week
+        used_grace = True
+    else:
+        streak = 1  # streak broke
+
+    save_pair(guild_id, a, b, streak, today.isoformat(), grace_week)
+    return streak, used_grace
+
+
+def streak_alive(last_day_str, today):
+    """A streak is shown on the leaderboard if it was completed yesterday or today."""
+    if not last_day_str:
+        return False
+    return date.fromisoformat(last_day_str) >= today - timedelta(days=1)
+
+
+async def do_streak(guild, author, target, channel_id):
+    """Sends your daily streak to someone. Returns (error, embed, ping_text)."""
+    if guild is None:
+        return "That only works inside a server.", None, None
+    if target.bot:
+        return "bots can't do streaks, bruh", None, None
+    if target.id == author.id:
+        return "you can't streak yourself lol", None, None
+
+    today = datetime.now(timezone.utc).date()
+    if has_sent(guild.id, author.id, target.id, today):
+        return (
+            f"you already sent **{target.display_name}** their streak today. "
+            f"come back tomorrow"
+        ), None, None
+
+    record_send(guild.id, author.id, target.id, today)
+
+    # Both sides sent today: the streak continues
+    if has_sent(guild.id, target.id, author.id, today):
+        streak, used_grace = complete_streak(guild.id, author.id, target.id, today)
+
+        embed = discord.Embed(
+            title="🔥 Streak kept alive",
+            description=f"**{author.display_name}** and **{target.display_name}** both sent today.",
+            color=COLOR_AFK,
+        )
+        embed.add_field(
+            name="Streak",
+            value=f"🔥 {streak} day{'' if streak == 1 else 's'}",
+            inline=True,
+        )
+        if used_grace:
+            embed.add_field(name="Grace day", value="Used this week's grace day for the missed day.", inline=False)
+        embed.set_footer(text="Streaks use UTC days")
+
+        dm = discord.Embed(
+            title="🔥 Streak kept alive",
+            description=(
+                f"Your streak with **{author.display_name}** in **{guild.name}** "
+                f"is now **{streak}** day{'' if streak == 1 else 's'}."
+            ),
+            color=COLOR_AFK,
+        )
+        try:
+            await target.send(embed=dm)
+        except discord.HTTPException:
+            pass  # their DMs are closed
+        return None, embed, None
+
+    # Only one side has sent so far
+    embed = discord.Embed(
+        title="🔥 Streak sent",
+        description=(
+            f"**{author.display_name}** sent **{target.display_name}** their streak.\n"
+            f"Waiting on **{target.display_name}** to send one back with `{PREFIX}streak @{author.name}`."
+        ),
+        color=COLOR_AFK,
+    )
+    embed.set_footer(text="Both of you need to send today")
+
+    dm = discord.Embed(
+        title="🔥 Streak request",
+        description=(
+            f"**{author.display_name}** sent you their streak in **{guild.name}**.\n"
+            f"Send one back with `{PREFIX}streak @{author.name}` today to keep it going."
+        ),
+        color=COLOR_AFK,
+    )
+    try:
+        await target.send(embed=dm)
+        ping = None
+    except discord.HTTPException:
+        ping = target.mention  # DMs closed, so ping them in the channel instead
+
+    return None, embed, ping
+
+
+async def do_streaks_board(guild, limit=10):
+    """Top active streak pairs in the server. Returns (error, embed)."""
+    if guild is None:
+        return "That only works inside a server.", None
+
+    today = datetime.now(timezone.utc).date()
+    rows = db.execute(
+        "SELECT user_low, user_high, streak, last_day FROM streak_pairs "
+        "WHERE guild_id = ? AND streak > 0 ORDER BY streak DESC",
+        (guild.id,),
+    ).fetchall()
+    active = [(low, high, streak) for low, high, streak, last in rows if streak_alive(last, today)][:limit]
+
+    if not active:
+        embed = discord.Embed(
+            title="🔥 Streak leaderboard",
+            description="No active streaks yet.",
+            color=COLOR_AFK,
+        )
+        return None, embed
+
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = [
+        f"{medals.get(i, f'**{i}.**')} <@{low}> + <@{high}> · 🔥 **{streak}** day{'' if streak == 1 else 's'}"
+        for i, (low, high, streak) in enumerate(active, 1)
+    ]
+    embed = discord.Embed(
+        title="🔥 Streak leaderboard",
+        description="\n".join(lines),
+        color=COLOR_AFK,
+    )
+    embed.set_footer(text="Both members send each day!")
+    return None, embed
+
+
+def get_user_streaks(guild_id, user_id):
+    """All active streak pairs that include this user."""
+    return db.execute(
+        "SELECT user_low, user_high, streak, last_day FROM streak_pairs "
+        "WHERE guild_id = ? AND (user_low = ? OR user_high = ?) AND streak > 0 "
+        "ORDER BY streak DESC",
+        (guild_id, user_id, user_id),
+    ).fetchall()
+
+
+async def do_slist(guild, user):
+    """Shows every active streak this user has. Returns (error, embed)."""
+    if guild is None:
+        return "That only works inside a server.", None
+
+    today = datetime.now(timezone.utc).date()
+    rows = get_user_streaks(guild.id, user.id)
+    active = [
+        (low, high, streak, last)
+        for low, high, streak, last in rows
+        if streak_alive(last, today)
+    ]
+
+    if not active:
+        embed = discord.Embed(
+            title=f"🔥 {user.display_name}'s streaks",
+            description="No active streaks yet.",
+            color=COLOR_AFK,
+        )
+        return None, embed
+
+    lines = []
+    for low, high, streak, last in active:
+        other = high if low == user.id else low
+        if date.fromisoformat(last) == today:
+            status = "✅ done for today"
+        elif has_sent(guild.id, user.id, other, today):
+            status = "⏳ you sent today, waiting on them"
+        else:
+            status = "⚠️ send one today to keep it going"
+        lines.append(f"<@{other}> · 🔥 **{streak}** day{'' if streak == 1 else 's'}\n{status}")
+
+    embed = discord.Embed(
+        title=f"🔥 {user.display_name}'s streaks",
+        description="\n\n".join(lines),
+        color=COLOR_AFK,
+    )
+    embed.set_footer(text=f"{len(active)} active · UTC days")
+    return None, embed
+
+
+# ---------------------------------------------------------------------------
+# Warning and moderation logic
+# ---------------------------------------------------------------------------
 async def do_warn(guild, author, target, category, reason, channel_id):
     problem = validate(guild, author, target)
     if problem:
@@ -580,7 +861,7 @@ async def do_warnings(guild, author, user_id):
         tag = "NSFW" if category == "nsfw" else "General"
         lines.append(f"**{number + 1}.** `{tag}` - {reason[:150]} - by <@{mod_id}> {when}")
     embed = discord.Embed(
-        title=f"⚠️ Warnings for {name}",
+        title=f"Warnings for {name}",
         description="\n".join(lines),
         color=COLOR_WARN,
     )
@@ -856,6 +1137,37 @@ async def prefix_clearwarns(message):
     await reply_result(message, error, result)
 
 
+async def prefix_streak(message):
+    """;streak @user - sends your daily streak to someone"""
+    args = message.content.strip().split()
+    target = await find_member(message.guild, args[1]) if len(args) > 1 else None
+    if target is None:
+        await message.reply(f"Usage: `{PREFIX}streak @user`")
+        return
+
+    error, embed, ping = await do_streak(message.guild, message.author, target, message.channel.id)
+    if error:
+        await message.reply(error, allowed_mentions=discord.AllowedMentions.none())
+        return
+    await message.reply(
+        content=ping,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(users=[target], roles=False, everyone=False, replied_user=False),
+    )
+
+
+async def prefix_streaks(message):
+    """;streaks - shows the top streak pairs"""
+    error, embed = await do_streaks_board(message.guild)
+    await reply_result(message, error, embed)
+
+
+async def prefix_slist(message):
+    """;slist - shows your active streaks"""
+    error, embed = await do_slist(message.guild, message.author)
+    await reply_result(message, error, embed)
+
+
 # ---------------------------------------------------------------------------
 # Help command: front page with COMMANDS / MODERATIONS buttons
 # ---------------------------------------------------------------------------
@@ -880,7 +1192,10 @@ def build_help_commands_embed(bot_user):
         f"**{PREFIX}afk <reason>** - Marks you as away. The bot tells anyone who pings you.\n"
         f"**{PREFIX}summarize** - Summarizes the last 50 messages in the channel.\n"
         f"**{PREFIX}reset** - Clears my memory in this channel.\n"
-        f"**{PREFIX}warns [@user]** - Shows your warnings. Mods can check anyone.\n"
+        f"**{PREFIX}warns @user** - Shows your warnings. Mods can check anyone.\n"
+        f"**{PREFIX}streak @user** - Sends your daily streak. Both of you need to send each day (UTC).\n"
+        f"**{PREFIX}streaks** - Shows the top active streaks in the server.\n"
+        f"**{PREFIX}slist** - Shows all of your active streaks and who still needs to send today.\n"
         "\n"
         "__**Chat:**__\n"
         "**@mention** - Mention me with a question and i'll answer.\n"
@@ -1076,6 +1391,19 @@ class Client(discord.Client):
 
         if command == f"{PREFIX}clearwarns":
             await prefix_clearwarns(message)
+            return
+
+        # Streaks
+        if command == f"{PREFIX}streak":
+            await prefix_streak(message)
+            return
+
+        if command == f"{PREFIX}streaks":
+            await prefix_streaks(message)
+            return
+
+        if command == f"{PREFIX}slist":
+            await prefix_slist(message)
             return
 
         # Prefix commands like ?reset and ?summarize
@@ -1347,6 +1675,41 @@ async def role_autocomplete(interaction: discord.Interaction, current: str):
     ][:25]
 
 
+@clients.tree.command(name="streak", description="Send your daily streak to a member")
+@app_commands.guild_only()
+@app_commands.describe(user="The member you want to streak with")
+async def slash_streak(interaction: discord.Interaction, user: discord.Member):
+    error, embed, ping = await do_streak(interaction.guild, interaction.user, user, interaction.channel_id)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    await interaction.response.send_message(
+        content=ping,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(users=[user], roles=False, everyone=False),
+    )
+
+
+@clients.tree.command(name="streaks", description="Show the top active streaks in this server")
+@app_commands.guild_only()
+async def slash_streaks(interaction: discord.Interaction):
+    error, embed = await do_streaks_board(interaction.guild)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed)
+
+
+@clients.tree.command(name="slist", description="Show all of your active streaks")
+@app_commands.guild_only()
+async def slash_slist(interaction: discord.Interaction):
+    error, embed = await do_slist(interaction.guild, interaction.user)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed)
+
+
 @clients.tree.command(name="warns", description="Show warnings (yours, or anyone's if you're a mod)")
 @app_commands.guild_only()
 @app_commands.describe(user="Whose warnings to show (leave empty for yours)")
@@ -1395,4 +1758,4 @@ async def slash_clearwarns(interaction: discord.Interaction, user: discord.User)
     await slash_finish(interaction, error, embed)
 
 
-clients.run("BOT_TOKEN")
+clients.run(os.getenv("DISCORD_TOKEN"))
