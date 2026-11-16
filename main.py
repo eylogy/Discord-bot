@@ -8,8 +8,11 @@ from discord import app_commands
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from zoneinfo import ZoneInfo
 
 load_dotenv()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 PREFIX = "?"
 
@@ -25,7 +28,7 @@ STATUS_INTERVAL = 60
 # Warning system settings
 # ---------------------------------------------------------------------------
 MOD_LOG_CHANNEL_ID = 0
-DB_FILE = "warnings.db"
+DB_FILE = os.path.join(BASE_DIR, "warnings.db")
 AUTO_BAN = True
 
 #   None  = reminder only (no action)
@@ -52,6 +55,9 @@ PROTECTED_PERMS = (
     "manage_channels",
     "manage_webhooks",
 )
+
+# Streak days reset at 12am in this timezone
+STREAK_TZ = ZoneInfo("Asia/Manila")
 
 SYSTEM_PROMPT = (
     "You are a chill Gen Z AI in a Discord server. Talk casually in lowercase with slang like "
@@ -113,7 +119,7 @@ if "category" not in _columns:
     db.execute("ALTER TABLE warnings ADD COLUMN category TEXT NOT NULL DEFAULT 'general'")
 db.commit()
 
-# streak_sends: one row per "?streak" a member sends to another member, per UTC day
+# streak_sends: one row per "?streak" a member sends to another member, per day
 db.execute(
     """CREATE TABLE IF NOT EXISTS streak_sends (
         guild_id INTEGER NOT NULL,
@@ -389,6 +395,11 @@ async def send_mod_log(guild, content, current_channel_id):
 # ---------------------------------------------------------------------------
 # Streak logic
 # ---------------------------------------------------------------------------
+def today_local():
+    """Today's date in STREAK_TZ. A new streak day starts at 12am in that timezone."""
+    return datetime.now(STREAK_TZ).date()
+
+
 def pair_key(a, b):
     """Stores each pair in the same order no matter who sent first."""
     return (min(a, b), max(a, b))
@@ -479,11 +490,10 @@ async def do_streak(guild, author, target, channel_id):
     if target.id == author.id:
         return "you can't streak yourself lol", None, None
 
-    today = datetime.now(timezone.utc).date()
+    today = today_local()
     if has_sent(guild.id, author.id, target.id, today):
         return (
             f"you already sent **{target.display_name}** their streak today. "
-            f"come back tomorrow"
         ), None, None
 
     record_send(guild.id, author.id, target.id, today)
@@ -504,7 +514,7 @@ async def do_streak(guild, author, target, channel_id):
         )
         if used_grace:
             embed.add_field(name="Grace day", value="Used this week's grace day for the missed day.", inline=False)
-        embed.set_footer(text="Streaks use UTC days")
+        embed.set_footer(text="Streak days reset every 12am")
 
         dm = discord.Embed(
             title="🔥 Streak kept alive",
@@ -525,7 +535,7 @@ async def do_streak(guild, author, target, channel_id):
         title="🔥 Streak sent",
         description=(
             f"**{author.display_name}** sent **{target.display_name}** their streak.\n"
-            f"Waiting on **{target.display_name}** to send one back with `{PREFIX}streak @{author.name}`."
+            f"Waiting on **{target.display_name}** to send one back."
         ),
         color=COLOR_AFK,
     )
@@ -553,7 +563,7 @@ async def do_streaks_board(guild, limit=10):
     if guild is None:
         return "That only works inside a server.", None
 
-    today = datetime.now(timezone.utc).date()
+    today = today_local()
     rows = db.execute(
         "SELECT user_low, user_high, streak, last_day FROM streak_pairs "
         "WHERE guild_id = ? AND streak > 0 ORDER BY streak DESC",
@@ -579,7 +589,7 @@ async def do_streaks_board(guild, limit=10):
         description="\n".join(lines),
         color=COLOR_AFK,
     )
-    embed.set_footer(text="Both members send each day!")
+    embed.set_footer(text="Both members send each day · resets every 12am")
     return None, embed
 
 
@@ -598,7 +608,7 @@ async def do_slist(guild, user):
     if guild is None:
         return "That only works inside a server.", None
 
-    today = datetime.now(timezone.utc).date()
+    today = today_local()
     rows = get_user_streaks(guild.id, user.id)
     active = [
         (low, high, streak, last)
@@ -618,11 +628,11 @@ async def do_slist(guild, user):
     for low, high, streak, last in active:
         other = high if low == user.id else low
         if date.fromisoformat(last) == today:
-            status = "✅ done for today"
+            status = "✅ active"
         elif has_sent(guild.id, user.id, other, today):
             status = "⏳ you sent today, waiting on them"
         else:
-            status = "⚠️ send one today to keep it going"
+            status = "⚠️ not active today"
         lines.append(f"<@{other}> · 🔥 **{streak}** day{'' if streak == 1 else 's'}\n{status}")
 
     embed = discord.Embed(
@@ -630,7 +640,7 @@ async def do_slist(guild, user):
         description="\n\n".join(lines),
         color=COLOR_AFK,
     )
-    embed.set_footer(text=f"{len(active)} active · UTC days")
+    embed.set_footer(text=f"{len(active)} active · resets every 12am")
     return None, embed
 
 
@@ -861,7 +871,7 @@ async def do_warnings(guild, author, user_id):
         tag = "NSFW" if category == "nsfw" else "General"
         lines.append(f"**{number + 1}.** `{tag}` - {reason[:150]} - by <@{mod_id}> {when}")
     embed = discord.Embed(
-        title=f"Warnings for {name}",
+        title=f"⚠️ Warnings for {name}",
         description="\n".join(lines),
         color=COLOR_WARN,
     )
@@ -1192,8 +1202,8 @@ def build_help_commands_embed(bot_user):
         f"**{PREFIX}afk <reason>** - Marks you as away. The bot tells anyone who pings you.\n"
         f"**{PREFIX}summarize** - Summarizes the last 50 messages in the channel.\n"
         f"**{PREFIX}reset** - Clears my memory in this channel.\n"
-        f"**{PREFIX}warns @user** - Shows your warnings. Mods can check anyone.\n"
-        f"**{PREFIX}streak @user** - Sends your daily streak. Both of you need to send each day (UTC).\n"
+        f"**{PREFIX}warns [@user]** - Shows your warnings. Mods can check anyone.\n"
+        f"**{PREFIX}streak @user** - Sends your daily streak. Both of you need to send each day (resets 12am PH time).\n"
         f"**{PREFIX}streaks** - Shows the top active streaks in the server.\n"
         f"**{PREFIX}slist** - Shows all of your active streaks and who still needs to send today.\n"
         "\n"
