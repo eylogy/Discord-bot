@@ -5,7 +5,6 @@
 <p align="center">
   <a href="#getting-started"><img src="https://img.shields.io/badge/GET%20STARTED-FFFFFF?style=for-the-badge&labelColor=000000" alt="Get Started"></a>
   <a href="#features"><img src="https://img.shields.io/badge/FEATURES-000000?style=for-the-badge&labelColor=FFFFFF" alt="Features"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/LICENSE-MIT-444444?style=for-the-badge" alt="License"></a>
 </p>
 
 <p align="center">
@@ -30,7 +29,7 @@
 - Warning system stored in a local SQLite database
 - Gemini AI integration for chatting and answering questions
 
-## Software that were used:
+## Tech stack
 
 - Python
 - discord.py
