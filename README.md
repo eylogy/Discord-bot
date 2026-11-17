@@ -21,6 +21,7 @@
 - Streak tracking for users, using local timezone dates
 - Warning system stored in a local SQLite database
 - Gemini AI integration for chatting and answering questions
+- An afk system that marks you as away
 
 ## Tech stack
 
