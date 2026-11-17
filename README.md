@@ -1,14 +1,6 @@
-<p align="center">
-  <img src="banner.png" alt="Diddy banner" width="100%">
-</p>
+<h3 align="center">Diddy, a Discord bot for my discord server.</h3>
 
-<p align="center">
-  <img src="logo.png" alt="Diddy logo" width="150">
-</p>
-
-<h3 align="center">Diddy, a Discord bot that tracks streaks and manages warnings.</h3>
-
-<p align="center"><em>Built in Python. Streaks are tracked in your local timezone.</em></p>
+<p align="center"><em>Built in Python.</em></p>
 
 <p align="center">
   <a href="#getting-started"><img src="https://img.shields.io/badge/GET%20STARTED-FFFFFF?style=for-the-badge&labelColor=000000" alt="Get Started"></a>
@@ -35,38 +27,12 @@
 ## Features
 
 - Streak tracking for users, using local timezone dates
-- Warning system stored in a local SQLite database (`warnings.db`)
-- [Add any other commands or features Diddy has]
+- Warning system stored in a local SQLite database
+- Gemini AI integration for chatting and answering questions
 
-## Getting Started
-
-```bash
-git clone https://github.com/[your-username]/diddy.git
-cd diddy
-pip install -r requirements.txt
-```
-
-Then run the bot:
-
-```bash
-python main.py
-```
-
-## Configuration
-
-Create a `.env` file in the project root with your bot token. Do not commit this file.
-
-```env
-DISCORD_TOKEN=your_token_here
-```
-
-## Tech Stack
+## Software that were used:
 
 - Python
 - discord.py
 - SQLite
 - python-dotenv
-
-## License
-
-This project is licensed under the [LICENSE_NAME] license. See [LICENSE](LICENSE) for details.
