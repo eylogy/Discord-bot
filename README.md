@@ -14,13 +14,6 @@
   <img src="https://img.shields.io/badge/Config-.env-FFFFFF?style=flat-square&labelColor=000000" alt=".env Config">
 </p>
 
-<p align="center">
-  <a href="#features">Features</a> ·
-  <a href="#getting-started">Getting Started</a> ·
-  <a href="#configuration">Configuration</a> ·
-  <a href="#tech-stack">Tech Stack</a>
-</p>
-
 ---
 
 ## Features
