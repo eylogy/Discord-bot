@@ -29,3 +29,6 @@
 - discord.py
 - SQLite
 - python-dotenv
+- Claude
+- ChatGPT
+- Gemini AI
